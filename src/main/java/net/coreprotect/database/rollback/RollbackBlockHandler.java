@@ -559,17 +559,36 @@ public class RollbackBlockHandler extends Queue {
      *            The user performing the rollback
      */
     public static void applyBlockChanges(Map<Block, PendingBlockChange> chunkChanges, int preview, Player user) {
+        if (preview == 0 || user == null) {
+            applyBlockChanges(chunkChanges, true, true);
+            applyBlockChanges(chunkChanges, true, false);
+            applyBlockChanges(chunkChanges, false, false);
+            applyBlockChanges(chunkChanges, false, true);
+            chunkChanges.clear();
+            return;
+        }
+
         for (Entry<Block, PendingBlockChange> chunkChange : chunkChanges.entrySet()) {
             Block changeBlock = chunkChange.getKey();
             PendingBlockChange change = chunkChange.getValue();
             BlockData changeBlockData = change.blockData();
-            if (preview > 0 && user != null) {
-                Util.sendBlockChange(user, changeBlock.getLocation(), changeBlockData);
-            }
-            else {
-                BlockUtils.setTypeAndData(changeBlock, null, changeBlockData, change.applyPhysics());
-            }
+            Util.sendBlockChange(user, changeBlock.getLocation(), changeBlockData);
         }
         chunkChanges.clear();
+    }
+
+    private static void applyBlockChanges(Map<Block, PendingBlockChange> chunkChanges, boolean airChange, boolean applyPhysics) {
+        for (Entry<Block, PendingBlockChange> chunkChange : chunkChanges.entrySet()) {
+            PendingBlockChange change = chunkChange.getValue();
+            boolean changeToAir = isAirChange(change);
+            if (changeToAir == airChange && change.applyPhysics() == applyPhysics) {
+                BlockUtils.setTypeAndData(chunkChange.getKey(), null, change.blockData(), !changeToAir && applyPhysics);
+            }
+        }
+    }
+
+    private static boolean isAirChange(PendingBlockChange change) {
+        BlockData blockData = change.blockData();
+        return blockData != null && BlockUtils.isAir(blockData.getMaterial());
     }
 }
