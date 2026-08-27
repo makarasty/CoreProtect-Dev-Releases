@@ -38,6 +38,22 @@ public class CommandParser {
         return ActionParser.parseAction(inputArguments);
     }
 
+    protected static List<Integer> parseAction(String[] inputArguments, boolean allowMultiple) {
+        return ActionParser.parseAction(inputArguments, allowMultiple);
+    }
+
+    protected static ActionParser.ParseResult parseActions(String[] inputArguments, boolean allowMultiple) {
+        return ActionParser.parseActions(inputArguments, allowMultiple);
+    }
+
+    protected static MessageFilterParser.ParseResult parseMessageFilters(String[] inputArguments) {
+        return MessageFilterParser.parse(inputArguments);
+    }
+
+    protected static RollbackStateParser.ParseResult parseRollbackState(String[] inputArguments) {
+        return RollbackStateParser.parse(inputArguments);
+    }
+
     /**
      * Parse coordinates from command arguments
      * 
@@ -62,6 +78,10 @@ public class CommandParser {
      */
     protected static boolean parseCount(String[] inputArguments) {
         return ActionParser.parseCount(inputArguments);
+    }
+
+    protected static boolean parseSummary(String[] inputArguments) {
+        return ActionParser.parseSummary(inputArguments);
     }
 
     /**

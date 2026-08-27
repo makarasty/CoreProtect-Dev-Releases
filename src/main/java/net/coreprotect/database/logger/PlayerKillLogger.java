@@ -1,8 +1,5 @@
 package net.coreprotect.database.logger;
 
-import java.sql.PreparedStatement;
-import java.util.Locale;
-
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.entity.EntityType;
@@ -10,12 +7,13 @@ import org.bukkit.entity.EntityType;
 import net.coreprotect.CoreProtect;
 import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
+import net.coreprotect.database.Database;
+import net.coreprotect.database.ConsumerWriteBatch;
 import net.coreprotect.database.statement.BlockStatement;
 import net.coreprotect.database.statement.UserStatement;
 import net.coreprotect.event.CoreProtectPreLogEvent;
 import net.coreprotect.model.action.LookupActions;
 import net.coreprotect.utility.WorldUtils;
-import net.coreprotect.utility.ErrorReporter;
 
 public class PlayerKillLogger {
 
@@ -23,15 +21,13 @@ public class PlayerKillLogger {
         throw new IllegalStateException("Database class");
     }
 
-    public static void log(PreparedStatement preparedStmt, int batchCount, String user, Location location, String player) {
+    public static void log(ConsumerWriteBatch preparedStmt, int batchCount, String user, Location location, String player) {
         try {
             if (ConfigHandler.isBlacklisted(user)) {
                 return;
             }
 
-            if (ConfigHandler.playerIdCache.get(player.toLowerCase(Locale.ROOT)) == null) {
-                UserStatement.loadId(preparedStmt.getConnection(), player, null);
-            }
+            int playerId = UserStatement.getId(preparedStmt, player, true);
 
             Location initialLocation = location.clone();
             CoreProtectPreLogEvent event = new CoreProtectPreLogEvent(user, initialLocation, CoreProtectPreLogEvent.Action.PLAYER_KILL, LookupActions.ENTITY_KILL, null, EntityType.PLAYER, null);
@@ -44,7 +40,6 @@ public class PlayerKillLogger {
             }
 
             int userId = UserStatement.getId(preparedStmt, event.getUser(), true);
-            int playerId = ConfigHandler.playerIdCache.get(player.toLowerCase(Locale.ROOT));
             Location eventLocation = event.getLocation();
             int wid = WorldUtils.getWorldId(eventLocation.getWorld().getName());
             int time = (int) (System.currentTimeMillis() / 1000L);
@@ -54,7 +49,7 @@ public class PlayerKillLogger {
             BlockStatement.insert(preparedStmt, batchCount, time, userId, wid, x, y, z, 0, playerId, null, null, LookupActions.ENTITY_KILL, 0);
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            Database.handleWriteFailure(e);
         }
     }
 

@@ -9,8 +9,8 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import net.coreprotect.CoreProtect;
 import net.coreprotect.command.CommandHandler;
+import net.coreprotect.command.PurgeCommand;
 import net.coreprotect.command.TabHandler;
-import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.language.Language;
@@ -23,6 +23,7 @@ import net.coreprotect.thread.TickTimeMonitor;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.ChatUtils;
 import net.coreprotect.utility.Extensions;
+import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.ErrorReporter;
 
 /**
@@ -53,8 +54,8 @@ public class PluginInitializationService {
 
         try {
             // Initialize core components
+            PurgeCommand.resetShutdownCancellation();
             Consumer.initialize();
-            new ListenerHandler(plugin);
 
             // Register commands
             registerCommands(plugin);
@@ -64,6 +65,9 @@ public class PluginInitializationService {
 
             // Initialize configuration
             start = ConfigHandler.performInitialization(true);
+            if (start) {
+                new ListenerHandler(plugin);
+            }
         }
         catch (Exception e) {
             ErrorReporter.report(e);
@@ -119,11 +123,14 @@ public class PluginInitializationService {
         PluginDescriptionFile pluginDescription = plugin.getDescription();
         ChatUtils.sendConsoleComponentStartup(Bukkit.getServer().getConsoleSender(), Phrase.build(Phrase.ENABLE_SUCCESS, ConfigHandler.EDITION_NAME));
 
-        if (Config.getGlobal().MYSQL) {
+        if (ConfigHandler.databaseType.isMySQL()) {
             Chat.console(Phrase.build(Phrase.USING_MYSQL));
         }
-        else {
+        else if (ConfigHandler.databaseType.isSQLite()) {
             Chat.console(Phrase.build(Phrase.USING_SQLITE));
+        }
+        else {
+            Chat.console(Phrase.build(Phrase.USING_DATABASE, ConfigHandler.databaseType.getDisplayName()));
         }
 
         Chat.console("--------------------");
@@ -157,9 +164,8 @@ public class PluginInitializationService {
         Thread cacheCleanUpThread = new Thread(new CacheHandler());
         cacheCleanUpThread.start();
 
-        // Start consumer
         Consumer.startConsumer();
-
+        EntitySpawnTracking.initializeLoadedEntities();
         Extensions.startBackgroundService();
     }
 
