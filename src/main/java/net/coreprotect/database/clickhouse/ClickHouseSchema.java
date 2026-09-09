@@ -314,7 +314,7 @@ public final class ClickHouseSchema {
         statements.add(view(names, ClickHouseFamily.SESSION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action"));
         statements.add(view(names, ClickHouseFamily.SIGN, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action,e.color AS color,e.color_secondary AS color_secondary,e.sign_data AS data,e.waxed AS waxed,e.face AS face,e.line_1 AS line_1,e.line_2 AS line_2,e.line_3 AS line_3,e.line_4 AS line_4,e.line_5 AS line_5,e.line_6 AS line_6,e.line_7 AS line_7,e.line_8 AS line_8"));
         statements.add(view(names, ClickHouseFamily.SKULL, "e.rowid AS rowid,e.time AS time,e.name AS owner,e.text AS skin"));
-        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,e.time AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
+        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,toUInt32(ifNull(e.data,toInt64(e.time))) AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
         statements.add(view(names, ClickHouseFamily.USERNAME_LOG, "e.rowid AS rowid,e.time AS time,e.uuid AS uuid,e.user_name AS `user`"));
         statements.add(currentView(names, ClickHouseFamily.VERSION, "e.rowid AS rowid,e.time AS time,e.version AS version"));
         statements.add(currentView(names, ClickHouseFamily.WORLD, "e.rowid AS rowid,e.id AS id,e.name AS world"));
@@ -322,13 +322,13 @@ public final class ClickHouseSchema {
 
     private static String view(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + events(names, family) + " AS e";
     }
 
     private static String currentView(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + currentEvents(names, family) + " AS e";
     }
 
@@ -354,6 +354,10 @@ public final class ClickHouseSchema {
 
     private static String location(String column) {
         return "if(e." + column + "_present=1,e." + column + ",NULL) AS " + column;
+    }
+
+    private static String locationKeys(ClickHouseFamily family) {
+        return family.isWorldScoped() ? ",e.wid AS _key_wid,e.x AS _key_x,e.z AS _key_z" : "";
     }
 
     private static String events(Names names, ClickHouseFamily family) {

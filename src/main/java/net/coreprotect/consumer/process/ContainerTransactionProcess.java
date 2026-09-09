@@ -42,6 +42,10 @@ class ContainerTransactionProcess {
     }
 
     static void process(ConsumerWriteBatch preparedStmtContainer, ConsumerWriteBatch preparedStmtItems, int batchCount, int processId, int id, Material type, int forceData, String user, Object object) {
+        if (object instanceof ContainerLogger.PreparedTransaction) {
+            ((ContainerLogger.PreparedTransaction) object).log(preparedStmtContainer, preparedStmtItems, batchCount, user);
+            return;
+        }
         if (!(object instanceof Location)) {
             return;
         }
@@ -57,10 +61,10 @@ class ContainerTransactionProcess {
         String loggingChestIdSuffix = HopperTransactionUtils.getLoggingIdSuffix(location);
         String loggingChestId = HopperTransactionUtils.getLoggingId(user, loggingChestIdSuffix);
         HopperTransactionUtils.synchronizeTransaction(transactingChestId,
-                () -> processTransaction(preparedStmtContainer, preparedStmtItems, batchCount, type, forceData, user, inventory, location, transactingChestId, loggingChestIdSuffix, loggingChestId));
+                () -> processTransaction(preparedStmtContainer, preparedStmtItems, batchCount, processId, id, type, forceData, user, inventory, location, transactingChestId, loggingChestIdSuffix, loggingChestId));
     }
 
-    private static void processTransaction(ConsumerWriteBatch preparedStmtContainer, ConsumerWriteBatch preparedStmtItems, int batchCount, Material type, int forceData, String user, Object inventory,
+    private static void processTransaction(ConsumerWriteBatch preparedStmtContainer, ConsumerWriteBatch preparedStmtItems, int batchCount, int processId, int id, Material type, int forceData, String user, Object inventory,
             Location location, String transactingChestId, String loggingChestIdSuffix, String loggingChestId) {
         if (ConfigHandler.loggingChest.get(loggingChestId) == null) {
             return;
@@ -73,10 +77,20 @@ class ContainerTransactionProcess {
         }
         int force_size = Queue.getForceContainerSize(loggingChestId);
         if (current_chest == forceData || force_size > 0) { // This prevents client side chest sorting mods from messing things up.
-            ContainerLogger.log(preparedStmtContainer, preparedStmtItems, batchCount, user, type, inventory, location);
-            List<ItemStack[]> old = ConfigHandler.oldContainer.get(loggingChestId);
-            if (old == null || old.isEmpty()) {
-                clearContainerTransaction(transactingChestId, loggingChestIdSuffix, loggingChestId);
+            try {
+                if (ConfigHandler.databaseType.isColumnar()) {
+                    ContainerLogger.log(preparedStmtContainer, preparedStmtItems, batchCount, user, type, inventory, location,
+                            prepared -> Consumer.consumerObjects.get(processId).put(id, prepared));
+                }
+                else {
+                    ContainerLogger.log(preparedStmtContainer, preparedStmtItems, batchCount, user, type, inventory, location);
+                }
+            }
+            finally {
+                List<ItemStack[]> old = ConfigHandler.oldContainer.get(loggingChestId);
+                if (old == null || old.isEmpty()) {
+                    clearContainerTransaction(transactingChestId, loggingChestIdSuffix, loggingChestId);
+                }
             }
         }
         else if (loggingChestId.startsWith("#hopper")) {
@@ -118,5 +132,46 @@ class ContainerTransactionProcess {
         ConfigHandler.loggingChest.remove(loggingId);
         Queue.removeForceContainer(loggingId);
         HopperTransactionUtils.removeOwner(transactionId, loggingId);
+    }
+
+    static void discard(int processId, int failedIndex, int forceData, String user, Location location) {
+        if (location.getWorld() == null) {
+            return;
+        }
+        String transactionId = HopperTransactionUtils.getTransactionId(location);
+        String locationSuffix = HopperTransactionUtils.getLoggingIdSuffix(location);
+        String loggingId = HopperTransactionUtils.getLoggingId(user, locationSuffix);
+        HopperTransactionUtils.synchronizeTransaction(transactionId, () -> {
+            List<ItemStack[]> old = ConfigHandler.oldContainer.get(loggingId);
+            if (old == null || old.isEmpty()) {
+                clearContainerTransaction(transactionId, locationSuffix, loggingId);
+                return;
+            }
+            Integer generation = ConfigHandler.loggingChest.get(loggingId);
+            int forceSize = Queue.getForceContainerSize(loggingId);
+            int snapshotIndex = 0;
+            List<Object[]> queued = Consumer.consumer.get(processId);
+            for (int index = 0; index < failedIndex; index++) {
+                if (Process.inventoryTransactionGeneration(processId, queued.get(index), Process.CONTAINER_TRANSACTION, loggingId) != null) {
+                    snapshotIndex++;
+                }
+            }
+            if (snapshotIndex >= forceSize) {
+                if (generation == null || generation != forceData) {
+                    return;
+                }
+                snapshotIndex = forceSize;
+            }
+            if (snapshotIndex < old.size()) {
+                old.remove(snapshotIndex);
+                if (snapshotIndex < forceSize) {
+                    Queue.pollForceContainer(loggingId, snapshotIndex);
+                }
+                HopperTransactionUtils.consumeSnapshot(transactionId, loggingId, snapshotIndex);
+            }
+            if (old.isEmpty()) {
+                clearContainerTransaction(transactionId, locationSuffix, loggingId);
+            }
+        });
     }
 }

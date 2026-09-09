@@ -50,6 +50,18 @@ public class UsernameAPI {
                 return result;
             }
 
+            Set<String> includedUuids = getUuids(connection, options.getUsers());
+            if (includedUuids != null && includedUuids.isEmpty() && !options.getUsers().isEmpty()) {
+                return result;
+            }
+
+            Set<String> excludedUuids = getUuids(connection, options.getExcludeUsers());
+            if (excludedUuids == null) {
+                return result;
+            }
+            // A NULL in NOT IN would also exclude unrelated users.
+            excludedUuids.remove(null);
+
             int checkTime = 0;
             if (options.getTime() > 0) {
                 checkTime = (int) (System.currentTimeMillis() / 1000L) - options.getTime();
@@ -57,11 +69,9 @@ public class UsernameAPI {
 
             StringBuilder query = new StringBuilder("SELECT time,uuid," + ConfigHandler.databaseType.getUserColumn() + " FROM ");
             query.append(ConfigHandler.prefix).append("username_log WHERE time > ?");
-            if (!uuids.isEmpty()) {
-                query.append(" AND uuid IN (");
-                appendPlaceholders(query, uuids.size());
-                query.append(")");
-            }
+            appendUuidFilter(query, uuids, false);
+            appendUuidFilter(query, includedUuids, false);
+            appendUuidFilter(query, excludedUuids, true);
             query.append(" ORDER BY ").append(ConfigHandler.getDescendingEventOrder());
             if (options.hasLimit()) {
                 query.append(" LIMIT ").append(options.getLimitCount()).append(" OFFSET ").append(options.getLimitOffset());
@@ -71,6 +81,14 @@ public class UsernameAPI {
                 int parameterIndex = 1;
                 statement.setInt(parameterIndex++, checkTime);
                 for (String uuid : uuids) {
+                    statement.setString(parameterIndex++, uuid);
+                }
+                if (includedUuids != null) {
+                    for (String uuid : includedUuids) {
+                        statement.setString(parameterIndex++, uuid);
+                    }
+                }
+                for (String uuid : excludedUuids) {
                     statement.setString(parameterIndex++, uuid);
                 }
 
@@ -88,13 +106,18 @@ public class UsernameAPI {
         return result;
     }
 
-    private static void appendPlaceholders(StringBuilder query, int count) {
-        for (int index = 0; index < count; index++) {
+    private static void appendUuidFilter(StringBuilder query, Set<String> uuids, boolean excluded) {
+        if (uuids == null || uuids.isEmpty()) {
+            return;
+        }
+        query.append(excluded ? " AND uuid NOT IN (" : " AND uuid IN (");
+        for (int index = 0; index < uuids.size(); index++) {
             if (index > 0) {
                 query.append(",");
             }
             query.append("?");
         }
+        query.append(")");
     }
 
     private static Set<String> getUuids(Connection connection, String user) throws Exception {
@@ -128,6 +151,21 @@ public class UsernameAPI {
         }
 
         return result.isEmpty() ? null : result;
+    }
+
+    private static Set<String> getUuids(Connection connection, List<String> users) throws Exception {
+        Set<String> result = new LinkedHashSet<>();
+        for (String user : users) {
+            Set<String> matches = getUuids(connection, user);
+            if (matches != null) {
+                if (matches.isEmpty()) {
+                    // An empty name or #global matches every user.
+                    return null;
+                }
+                result.addAll(matches);
+            }
+        }
+        return result;
     }
 
     private static boolean looksLikeUuid(String value) {
