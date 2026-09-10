@@ -27,53 +27,45 @@ import com.sk89q.worldedit.world.block.BlockState;
 import com.sk89q.worldedit.world.block.BlockStateHolder;
 
 import net.coreprotect.config.Config;
+import net.coreprotect.model.BlockGroup;
 import net.coreprotect.utility.ItemUtils;
 
 public class CoreProtectLogger extends AbstractDelegateExtent {
     private final Actor eventActor;
     private final World eventWorld;
-    private final Extent eventExtent;
 
     protected CoreProtectLogger(Actor actor, World world, Extent extent) {
         super(extent);
         this.eventActor = actor;
         this.eventWorld = world;
-        this.eventExtent = extent;
     }
 
     @Override
     public <T extends BlockStateHolder<T>> boolean setBlock(BlockVector3 position, T block) throws WorldEditException {
+        Extent eventExtent = getExtent();
         org.bukkit.World world = BukkitAdapter.adapt(eventWorld);
-        if (!Config.getConfig(world).WORLDEDIT) {
-            if (CoreProtectEditSessionEvent.isFAWE()) {
-                return eventExtent.setBlock(position.getX(), position.getY(), position.getZ(), block);
-            }
-            else {
-                return eventExtent.setBlock(position, block);
-            }
+        Config config = Config.getConfig(world);
+        if (!config.WORLDEDIT) {
+            return eventExtent.setBlock(position, block);
         }
 
         BlockState oldBlock = eventExtent.getBlock(position);
+        if (oldBlock == block.toImmutableState()) {
+            return eventExtent.setBlock(position, block);
+        }
+
         Material oldType = BukkitAdapter.adapt(oldBlock.getBlockType());
         Location location = new Location(world, position.getBlockX(), position.getBlockY(), position.getBlockZ());
-        BaseBlock baseBlock = WorldEditLogger.getBaseBlock(eventExtent, position, location, oldType, oldBlock);
+        BaseBlock baseBlock = WorldEditLogger.needsBaseBlock(oldType, config) ? eventExtent.getFullBlock(position) : null;
 
         // No clear way to get container content data from within the WorldEdit API
         // Data may be available by converting oldBlock.toBaseBlock().getNbtData()
         // e.g. BaseBlock block = eventWorld.getBlock(position);
-        ItemStack[] containerData = CoreProtectEditSessionEvent.isFAWE() ? null : ItemUtils.getContainerContents(oldType, null, location);
+        ItemStack[] containerData = !CoreProtectEditSessionEvent.isFAWE() && config.ITEM_TRANSACTIONS && BlockGroup.CONTAINERS.contains(oldType) ? ItemUtils.getContainerContents(oldType, null, location) : null;
 
-        if (CoreProtectEditSessionEvent.isFAWE()) {
-            if (eventExtent.setBlock(position.getX(), position.getY(), position.getZ(), block)) {
-                WorldEditLogger.postProcess(eventExtent, eventActor, position, location, block, baseBlock, oldType, oldBlock, containerData);
-                return true;
-            }
-        }
-        else {
-            if (eventExtent.setBlock(position, block)) {
-                WorldEditLogger.postProcess(eventExtent, eventActor, position, location, block, baseBlock, oldType, oldBlock, containerData);
-                return true;
-            }
+        if (eventExtent.setBlock(position, block)) {
+            WorldEditLogger.postProcess(eventExtent, eventActor, position, location, block, baseBlock, oldType, oldBlock, containerData);
+            return true;
         }
 
         return false;
@@ -86,6 +78,7 @@ public class CoreProtectLogger extends AbstractDelegateExtent {
 
     @Override
     public int replaceBlocks(final Region region, final Mask mask, final Pattern pattern) throws MaxChangedBlocksException {
+        Extent eventExtent = getExtent();
         org.bukkit.World world = BukkitAdapter.adapt(eventWorld);
         if (!Config.getConfig(world).WORLDEDIT) {
             return eventExtent.replaceBlocks(region, mask, pattern);
@@ -103,6 +96,7 @@ public class CoreProtectLogger extends AbstractDelegateExtent {
 
     @Override
     public int setBlocks(Region region, Pattern pattern) throws MaxChangedBlocksException {
+        Extent eventExtent = getExtent();
         org.bukkit.World world = BukkitAdapter.adapt(eventWorld);
         if (!Config.getConfig(world).WORLDEDIT) {
             return eventExtent.setBlocks(region, pattern);
@@ -113,6 +107,7 @@ public class CoreProtectLogger extends AbstractDelegateExtent {
 
     @Override
     public int setBlocks(Set<BlockVector3> vset, Pattern pattern) {
+        Extent eventExtent = getExtent();
         org.bukkit.World world = BukkitAdapter.adapt(eventWorld);
         if (!Config.getConfig(world).WORLDEDIT) {
             return eventExtent.setBlocks(vset, pattern);

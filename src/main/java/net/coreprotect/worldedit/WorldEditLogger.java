@@ -46,28 +46,28 @@ public class WorldEditLogger extends Queue {
         return (WorldEditPlugin) plugin;
     }
 
-    protected static BaseBlock getBaseBlock(Extent extent, BlockVector3 position, Location location, Material oldType, com.sk89q.worldedit.world.block.BlockState oldBlock) {
-        if (oldType == Material.SPAWNER || (Config.getConfig(location.getWorld()).SIGN_TEXT && net.coreprotect.bukkit.BukkitAdapter.ADAPTER.isSign(oldType))) {
-            return extent.getFullBlock(position);
-        }
-
-        return null;
+    protected static boolean needsBaseBlock(Material type, Config config) {
+        return type == Material.SPAWNER || (config.SIGN_TEXT && net.coreprotect.bukkit.BukkitAdapter.ADAPTER.isSign(type));
     }
 
     protected static void postProcess(Extent extent, Actor actor, BlockVector3 position, Location location, BlockStateHolder<?> blockStateHolder, BaseBlock baseBlock, Material oldType, com.sk89q.worldedit.world.block.BlockState oldBlockState, ItemStack[] containerContents) {
+        postProcess(extent, actor, position, location, blockStateHolder, baseBlock, oldType, oldBlockState, containerContents, true);
+    }
+
+    protected static void postProcess(Extent extent, Actor actor, BlockVector3 position, Location location, BlockStateHolder<?> blockStateHolder, BaseBlock baseBlock, Material oldType, com.sk89q.worldedit.world.block.BlockState oldBlockState, ItemStack[] containerContents, boolean logBlockPhysics) {
         BlockData oldBlockData = BukkitAdapter.adapt(oldBlockState);
         BlockData newBlockData = BukkitAdapter.adapt(blockStateHolder.toImmutableState());
         Material newType = newBlockData.getMaterial();
 
         String oldBlockDataString = oldBlockData.getAsString();
         String newBlockDataString = newBlockData.getAsString();
-        BlockState oldBlock = new WorldEditBlockState(location, oldType, oldBlockData);
-        BlockState newBlock = new WorldEditBlockState(location, newType, newBlockData);
-
-        int oldBlockExtraData = 0;
-        int newBlockExtraData = -1;
 
         if (!oldType.equals(newType) || !oldBlockDataString.equals(newBlockDataString)) {
+            BlockState oldBlock = new WorldEditBlockState(location, oldType, oldBlockData);
+            BlockState newBlock = new WorldEditBlockState(location, newType, newBlockData);
+            int oldBlockExtraData = 0;
+            int newBlockExtraData = -1;
+
             try {
                 if (baseBlock != null && baseBlock.hasNbtData()) {
                     if (Config.getConfig(location.getWorld()).SIGN_TEXT && net.coreprotect.bukkit.BukkitAdapter.ADAPTER.isSign(oldType)) {
@@ -118,7 +118,7 @@ public class WorldEditLogger extends Queue {
             }
             else if ((!oldType.equals(Material.AIR) && !oldType.equals(Material.CAVE_AIR)) && (!newType.equals(Material.AIR) && !newType.equals(Material.CAVE_AIR))) {
                 // replaced a block
-                Waterlogged waterlogged = BlockUtils.checkWaterlogged(newBlockData, oldBlock);
+                Waterlogged waterlogged = logBlockPhysics ? BlockUtils.checkWaterlogged(newBlockData, oldBlock) : null;
                 if (waterlogged != null) {
                     newBlockDataString = waterlogged.getAsString();
                     oldBlock = null;
@@ -132,13 +132,13 @@ public class WorldEditLogger extends Queue {
                 // removed a block
                 Queue.queueBlockBreak(actor.getName(), oldBlock, oldBlock.getType(), oldBlockDataString, null, oldBlockExtraData, 0);
 
-                if (oldBlockData instanceof Waterlogged) {
+                if (logBlockPhysics && oldBlockData instanceof Waterlogged) {
                     Waterlogged waterlogged = (Waterlogged) oldBlockData;
                     if (waterlogged.isWaterlogged()) {
                         Queue.queueBlockPlace(actor.getName(), newBlock, newType, null, Material.WATER, -1, 0, null);
                     }
                 }
-                else if (oldBlockData instanceof Bisected) {
+                else if (logBlockPhysics && oldBlockData instanceof Bisected) {
                     Bisected bisected = (Bisected) oldBlockData;
                     Location bisectLocation = location.clone();
                     if (bisected.getHalf() == Half.TOP) {
