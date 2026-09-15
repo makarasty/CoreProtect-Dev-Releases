@@ -62,7 +62,8 @@ public class LookupCommand {
         int argWid = CommandParser.parseWorld(args, true, true);
         int parseRows = CommandParser.parseRows(args);
         boolean summary = CommandParser.parseSummary(args);
-        LookupOutputMode outputMode = summary ? LookupOutputMode.SUMMARY : LookupOutputMode.DETAIL;
+        LookupOutputMode outputMode = summary ? LookupOutputMode.SUMMARY
+                : CommandParser.parseCount(args) ? LookupOutputMode.COUNT : LookupOutputMode.DETAIL;
         RollbackStateParser.ParseResult rollbackStateResult = CommandParser.parseRollbackState(args);
         LookupRollbackState rollbackState = rollbackStateResult.getState();
         boolean worldedit = CommandParser.parseWorldEdit(args);
@@ -294,7 +295,7 @@ public class LookupCommand {
             }
         }
 
-        if (startTime <= 0 && !pageLookup && type == 4 && (argBlocks.size() > 0 || argUsers.size() > 0)) {
+        if (startTime <= 0 && argRadius == null && !pageLookup && type == 4 && (argBlocks.size() > 0 || argUsers.size() > 0)) {
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.MISSING_LOOKUP_TIME, Selector.FIRST));
             return;
         }
