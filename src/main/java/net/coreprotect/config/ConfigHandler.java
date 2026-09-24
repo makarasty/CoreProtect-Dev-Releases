@@ -84,8 +84,8 @@ public class ConfigHandler extends Queue {
     public static final String COMMUNITY_EDITION = "Community Edition";
     public static final String JAVA_VERSION = "11.0";
     public static final String MINECRAFT_VERSION = "1.16.5";
-    public static final String PATCH_VERSION = "24.0";
-    public static final String LATEST_VERSION = "26.2";
+    public static final String PATCH_VERSION = "24.1";
+    public static final String LATEST_VERSION = "26.3";
     private static final String DEFAULT_SQLITE_DATABASE = "database.db";
     public static String path = "plugins/CoreProtect/";
     public static String sqlite = DEFAULT_SQLITE_DATABASE;
@@ -272,7 +272,7 @@ public class ConfigHandler extends Queue {
     public static Map<String, Integer[]> lookupRadius = syncMap();
     public static Map<String, String> lookupTime = syncMap();
     public static Map<String, Long[]> lookupRows = syncMap();
-    public static Map<String, LookupCursor> lookupDuckDBCursor = syncMap();
+    public static Map<String, LookupCursor> lookupCursor = syncMap();
     public static Map<String, String> uuidCache = syncMap();
     public static Map<String, String> uuidCacheReversed = syncMap();
     public static Map<String, Integer> playerIdCache = syncMap();
@@ -524,7 +524,7 @@ public class ConfigHandler extends Queue {
 
                 Class.forName(ConfigHandler.databaseType.isDuckDB() ? "org.duckdb.DuckDBDriver" : "org.sqlite.JDBC");
             } catch (Exception e) {
-                ErrorReporter.report(e);
+                throw new IllegalStateException("Failed to initialize " + ConfigHandler.databaseType.getDisplayName(), e);
             }
         } else {
             HikariConfig config = new HikariConfig();
