@@ -40,6 +40,7 @@ import org.bukkit.persistence.PersistentDataType;
 import net.coreprotect.CoreProtect;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.listener.entity.VehicleDestroyListener;
 import net.coreprotect.listener.player.InventoryChangeListener;
 import net.coreprotect.model.entity.EntityInteractionOrigin;
 import net.coreprotect.model.entity.EntitySpawnData;
@@ -704,6 +705,7 @@ public final class EntitySpawnTracking {
 
     public static void removeWithoutRemovalLog(Entity entity) {
         UUID uuid = entity.getUniqueId();
+        VehicleDestroyListener.cancelTntRemoval(entity);
         coreProtectRemovals.add(uuid);
         try {
             entity.remove();
@@ -932,22 +934,38 @@ public final class EntitySpawnTracking {
     }
 
     public static boolean retryPendingDatabaseIdentityVerification(UUID uuid) {
+        return retryPendingDatabaseIdentityVerification(uuid, null);
+    }
+
+    public static boolean retryPendingDatabaseIdentityVerification(UUID uuid, EntitySpawnData data) {
         PendingIdentityVerification verification = pendingIdentityVerifications.get(uuid);
         if (verification == null) {
             return false;
         }
         PendingIdentityVerification retry = new PendingIdentityVerification(verification.location, verificationEpoch.get());
+        EntitySpawnData retryData = data == null ? EntitySpawnData.verify(uuid, retry.epoch) : data.retryVerification(retry.epoch);
+        if (retryData == null) {
+            return false;
+        }
         if (!pendingIdentityVerifications.replace(uuid, verification, retry)) {
             return false;
         }
         try {
-            Queue.queueEntitySpawnUpdate(EntitySpawnData.verify(uuid, retry.epoch));
+            Queue.queueEntitySpawnUpdate(retryData);
         }
         catch (RuntimeException exception) {
             pendingIdentityVerifications.replace(uuid, retry, verification);
             throw exception;
         }
         return true;
+    }
+
+    public static void abandonDatabaseIdentityVerification(UUID uuid, long epoch) {
+        pendingClear.compute(uuid, (key, request) -> {
+            pendingIdentityVerifications.computeIfPresent(uuid, (id, verification) -> verification.epoch == epoch ? null : verification);
+            trackedLocations.computeIfPresent(uuid, (id, tracked) -> tracked.isPendingVerification(epoch) ? tracked.withVerifiedEpoch(-1L) : tracked);
+            return request;
+        });
     }
 
     public static void confirmDatabaseVerification(UUID uuid, long epoch) {
