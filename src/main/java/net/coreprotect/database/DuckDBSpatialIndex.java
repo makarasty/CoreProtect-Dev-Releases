@@ -1,5 +1,6 @@
 package net.coreprotect.database;
 
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -8,16 +9,16 @@ import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.duckdb.DuckDBConnection;
-
-import net.coreprotect.utility.DatabaseUtils;
 
 public final class DuckDBSpatialIndex {
 
@@ -33,29 +34,67 @@ public final class DuckDBSpatialIndex {
     private static final long MAXIMUM_FILTER_PROBES = 2_000_000L;
     private static final int INDEX_CHECKPOINT_SEGMENTS = 64;
     private static final int BOOTSTRAP_PAGE_ROWS = 10_000;
+    private static final int MAX_SNAPSHOT_LOAD_ATTEMPTS = 3;
+    private static final int GAP_BUCKET_SHIFT = 16;
+    private static final int MAXIMUM_GAP_BUCKETS = 16;
+    private static final int GAP_QUERY_BATCH_SIZE = 8_192;
+    private static final String TABLE_DEFINITION = "("
+            + "table_id TINYINT NOT NULL,"
+            + "start_rowid BIGINT NOT NULL,"
+            + "end_rowid BIGINT NOT NULL,"
+            + "row_count INTEGER NOT NULL,"
+            + "chunks BLOB NOT NULL,"
+            + "entities BLOB,"
+            + "PRIMARY KEY(table_id,start_rowid))";
     private static final String DEFAULT_ALIAS = "duckdb_spatial_rows";
     private static final Object STATE_LOCK = new Object();
     private static final ReentrantLock INITIALIZATION_LOCK = new ReentrantLock();
+    private static final ReentrantLock SNAPSHOT_LOAD_LOCK = new ReentrantLock();
 
     private static String runtimeKey;
     private static WriterState runtimeState;
     private static IndexCache indexCache;
+    private static SnapshotLoad activeLoad;
     private static long runtimeGeneration;
+    private static long cacheGeneration;
 
     private DuckDBSpatialIndex() {
         throw new IllegalStateException("Database class");
     }
 
     static void createTable(String prefix, Statement statement) throws SQLException {
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "duckdb_spatial_index ("
-                + "table_id TINYINT NOT NULL,"
-                + "start_rowid BIGINT NOT NULL,"
-                + "end_rowid BIGINT NOT NULL,"
-                + "row_count INTEGER NOT NULL,"
-                + "chunks BLOB NOT NULL,"
-                + "entities BLOB,"
-                + "PRIMARY KEY(table_id,start_rowid))");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "duckdb_spatial_index " + TABLE_DEFINITION);
         reset();
+    }
+
+    public static boolean repairEmptyGaps(Connection connection, String prefix) throws SQLException {
+        String indexTable = prefix + "duckdb_spatial_index";
+        if (!hasTable(connection, indexTable) || !hasIndexGaps(connection, indexTable)) {
+            return false;
+        }
+
+        Map<Source, List<IndexSpan>> spansBySource = loadIndexSpans(connection, indexTable);
+        List<Integer> adjustedTables = new ArrayList<>();
+        List<Long> oldStarts = new ArrayList<>();
+        List<Long> newStarts = new ArrayList<>();
+        for (Source source : Source.values()) {
+            List<IndexSpan> spans = spansBySource.get(source);
+            if (spans == null || spans.isEmpty()) {
+                continue;
+            }
+            String tableName = prefix + source.table;
+            if (!hasTable(connection, tableName)) {
+                continue;
+            }
+            collectSourceGapAdjustments(connection, source, tableName, spans, adjustedTables, oldStarts, newStarts);
+        }
+        if (adjustedTables.isEmpty()) {
+            return false;
+        }
+
+        rebuildSpatialIndex(connection, indexTable, adjustedTables, oldStarts, newStarts);
+        reset();
+        return true;
     }
 
     static Transaction begin(Connection connection, String prefix) throws SQLException {
@@ -77,14 +116,13 @@ public final class DuckDBSpatialIndex {
                     observedGeneration = runtimeGeneration;
                 }
 
-                WriterState loaded = loadWriterState(connection, prefix);
+                WriterState loaded = loadWriterState(connection, prefix, key, observedGeneration);
                 synchronized (STATE_LOCK) {
                     if (observedGeneration != runtimeGeneration) {
                         continue;
                     }
                     runtimeState = loaded;
                     runtimeKey = key;
-                    indexCache = null;
                     runtimeGeneration++;
                     return new Transaction(key, prefix, runtimeGeneration, runtimeState.copy());
                 }
@@ -238,10 +276,14 @@ public final class DuckDBSpatialIndex {
 
         List<RowRange> ranges = new ArrayList<>();
         int matchedSegments = 0;
+        long totalIndexedRows = 0L;
+        long includedRows = 0L;
+        long pendingGapRows = 0L;
         long previousEnd = 0L;
         for (Segment segment : snapshot.segments) {
+            totalIndexedRows += segment.rowCount;
             if (previousEnd < Long.MAX_VALUE && segment.startRowId > previousEnd + 1L) {
-                addRange(ranges, previousEnd + 1L, segment.startRowId - 1L);
+                pendingGapRows = addRange(ranges, previousEnd + 1L, segment.startRowId - 1L, pendingGapRows);
             }
             previousEnd = Math.max(previousEnd, segment.endRowId);
             boolean spatialMatch = chunks.length > 0 && segment.chunks.mightContainAny(chunks);
@@ -249,10 +291,11 @@ public final class DuckDBSpatialIndex {
             boolean requiredRowMatch = containsAny(segment, requiredRowIds);
             if (spatialMatch || entityMatch || requiredRowMatch) {
                 matchedSegments++;
-                addRange(ranges, segment.startRowId, segment.endRowId);
+                includedRows += segment.rowCount;
+                pendingGapRows = addRange(ranges, segment.startRowId, segment.endRowId, pendingGapRows);
             }
-            if (ranges.size() > MAXIMUM_PREDICATE_RANGES) {
-                return null;
+            else if (!ranges.isEmpty() && segment.endRowId > ranges.get(ranges.size() - 1).end) {
+                pendingGapRows += segment.rowCount;
             }
         }
         if (matchedSegments == snapshot.segments.size()) {
@@ -260,9 +303,51 @@ public final class DuckDBSpatialIndex {
         }
 
         if (snapshot.lastIndexedRowId < Long.MAX_VALUE) {
-            addRange(ranges, snapshot.lastIndexedRowId + 1L, Long.MAX_VALUE);
+            addRange(ranges, snapshot.lastIndexedRowId + 1L, Long.MAX_VALUE, pendingGapRows);
         }
-        return ranges.isEmpty() || ranges.size() > MAXIMUM_PREDICATE_RANGES ? null : ranges;
+        if (ranges.isEmpty()) {
+            return null;
+        }
+        return ranges.size() <= MAXIMUM_PREDICATE_RANGES
+                ? ranges
+                : coalesceRanges(ranges, includedRows, totalIndexedRows);
+    }
+
+    private static List<RowRange> coalesceRanges(List<RowRange> ranges, long includedRows, long totalIndexedRows) {
+        int gapCount = ranges.size() - 1;
+        int merges = ranges.size() - MAXIMUM_PREDICATE_RANGES;
+        long[] sortedGaps = new long[gapCount];
+        for (int i = 0; i < gapCount; i++) {
+            sortedGaps[i] = ranges.get(i + 1).gapBefore;
+        }
+        Arrays.sort(sortedGaps);
+        long threshold = sortedGaps[merges - 1];
+        int equalBudget = 0;
+        for (int i = merges - 1; i >= 0 && sortedGaps[i] == threshold; i--) {
+            equalBudget++;
+        }
+
+        List<RowRange> merged = new ArrayList<>(MAXIMUM_PREDICATE_RANGES);
+        RowRange current = ranges.get(0);
+        for (int i = 1; i < ranges.size(); i++) {
+            RowRange next = ranges.get(i);
+            long gap = next.gapBefore;
+            if (gap < threshold || (gap == threshold && equalBudget > 0)) {
+                if (gap == threshold) {
+                    equalBudget--;
+                }
+                current.end = next.end;
+                includedRows += gap;
+            }
+            else {
+                merged.add(current);
+                current = next;
+            }
+        }
+        merged.add(current);
+        return includedRows >= totalIndexedRows || (merged.size() == 1 && merged.get(0).start <= 1L && merged.get(0).end == Long.MAX_VALUE)
+                ? null
+                : merged;
     }
 
     private static String alias(String alias) {
@@ -281,12 +366,40 @@ public final class DuckDBSpatialIndex {
         synchronized (STATE_LOCK) {
             runtimeKey = null;
             runtimeState = null;
-            indexCache = null;
+            invalidateCache(null);
             runtimeGeneration++;
         }
     }
 
-    private static WriterState loadWriterState(Connection connection, String prefix) throws SQLException {
+    private static void invalidateCache(String key) {
+        if (indexCache != null && (key == null || key.equals(indexCache.key))) {
+            indexCache = null;
+        }
+        if (activeLoad != null && (key == null || key.equals(activeLoad.key))) {
+            activeLoad = null;
+        }
+        cacheGeneration++;
+    }
+
+    private static void publishCommittedSegments(String key, List<PendingSegment> committedSegments) {
+        if (committedSegments.isEmpty()) {
+            return;
+        }
+        if (activeLoad != null && key.equals(activeLoad.key)) {
+            activeLoad.committedSegments.addAll(committedSegments);
+        }
+        if (indexCache != null && key.equals(indexCache.key)) {
+            Map<Source, IndexSnapshot> updated = appendSegments(indexCache.snapshots, committedSegments);
+            if (updated == null) {
+                invalidateCache(key);
+            }
+            else if (updated != indexCache.snapshots) {
+                indexCache = new IndexCache(key, updated);
+            }
+        }
+    }
+
+    private static WriterState loadWriterState(Connection connection, String prefix, String key, long observedGeneration) throws SQLException {
         WriterState state = new WriterState();
         DuckDBConnection duckDBConnection = connection.unwrap(DuckDBConnection.class);
         try (Connection scanConnection = duckDBConnection.duplicate(); Connection metadataConnection = duckDBConnection.duplicate()) {
@@ -297,9 +410,10 @@ public final class DuckDBSpatialIndex {
             }
             for (Source source : Source.values()) {
                 long indexedThrough = indexedThrough(scanConnection, prefix, source);
+                state.accumulator(source).coveredThrough = indexedThrough;
                 long highWater = sourceHighWater(scanConnection, prefix, source);
                 if (highWater > indexedThrough) {
-                    scanSource(scanConnection, metadataConnection, prefix, source, indexedThrough, highWater, state);
+                    scanSource(scanConnection, metadataConnection, prefix, source, indexedThrough, highWater, state, key, observedGeneration);
                 }
             }
         }
@@ -321,7 +435,7 @@ public final class DuckDBSpatialIndex {
     }
 
     private static void scanSource(Connection connection, Connection metadataConnection, String prefix, Source source,
-            long indexedThrough, long highWater, WriterState state) throws SQLException {
+            long indexedThrough, long highWater, WriterState state, String key, long observedGeneration) throws SQLException {
         String sql = "SELECT rowid,wid,x,z" + (source.entityRows ? ",entity_spawn_rowid" : "") + " FROM " + prefix + source.table
                 + " WHERE rowid>? AND rowid<=? ORDER BY rowid";
         String nextSql = "SELECT min(rowid) FROM " + prefix + source.table + " WHERE rowid>? AND rowid<=?";
@@ -346,7 +460,7 @@ public final class DuckDBSpatialIndex {
                         Integer entitySpawnRowId = source.entityRows ? resultSet.getInt("entity_spawn_rowid") : null;
                         accumulator.add(rowId, resultSet.getInt("wid"), resultSet.getInt("x"), resultSet.getInt("z"), entitySpawnRowId);
                         if (accumulator.completed.size() != completedCount && state.completedCount() >= INDEX_CHECKPOINT_SEGMENTS) {
-                            writeCompleted(metadataConnection, prefix, state);
+                            writeCompleted(metadataConnection, prefix, state, key, observedGeneration);
                         }
                     }
                 }
@@ -371,13 +485,22 @@ public final class DuckDBSpatialIndex {
             throw new SQLException("DuckDB spatial index scan ended before its high water mark for " + source.table);
         }
         accumulator.finish();
-        writeCompleted(metadataConnection, prefix, state);
+        writeCompleted(metadataConnection, prefix, state, key, observedGeneration);
     }
 
-    private static void writeCompleted(Connection connection, String prefix, WriterState state) throws SQLException {
+    private static void writeCompleted(Connection connection, String prefix, WriterState state, String key, long observedGeneration) throws SQLException {
         try {
-            if (state.writeCompleted(connection, prefix)) {
+            List<PendingSegment> committedSegments = new ArrayList<>();
+            if (state.writeCompleted(connection, prefix, committedSegments)) {
                 connection.commit();
+                synchronized (STATE_LOCK) {
+                    if (observedGeneration == runtimeGeneration) {
+                        publishCommittedSegments(key, committedSegments);
+                    }
+                    else {
+                        invalidateCache(key);
+                    }
+                }
             }
         }
         catch (SQLException | RuntimeException | Error exception) {
@@ -393,61 +516,486 @@ public final class DuckDBSpatialIndex {
 
     private static Map<Source, IndexSnapshot> snapshots(Connection connection, String prefix) throws SQLException {
         String key = databaseKey(connection, prefix);
-        while (true) {
-            long observedGeneration;
-            synchronized (STATE_LOCK) {
-                if (indexCache != null && key.equals(indexCache.key)) {
-                    return indexCache.snapshots;
-                }
-                observedGeneration = runtimeGeneration;
+        synchronized (STATE_LOCK) {
+            if (indexCache != null && key.equals(indexCache.key)) {
+                return indexCache.snapshots;
             }
+        }
 
-            Map<Source, IndexSnapshot> loaded = new EnumMap<>(Source.class);
-            for (Source source : Source.values()) {
-                loaded.put(source, new IndexSnapshot());
-            }
-            String sql = "SELECT table_id,start_rowid,end_rowid,row_count,chunks,entities FROM " + prefix + "duckdb_spatial_index ORDER BY table_id,start_rowid";
-            try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
-                while (resultSet.next()) {
-                    Source source = Source.fromId(resultSet.getInt("table_id"));
-                    if (source == null) {
+        SNAPSHOT_LOAD_LOCK.lock();
+        try {
+            for (int attempt = 0; attempt < MAX_SNAPSHOT_LOAD_ATTEMPTS; attempt++) {
+                long observedCacheGeneration;
+                SnapshotLoad load = new SnapshotLoad(key);
+                synchronized (STATE_LOCK) {
+                    if (indexCache != null && key.equals(indexCache.key)) {
+                        return indexCache.snapshots;
+                    }
+                    observedCacheGeneration = cacheGeneration;
+                    activeLoad = load;
+                }
+
+                Map<Source, IndexSnapshot> loaded;
+                try {
+                    loaded = loadSnapshots(connection, prefix);
+                }
+                catch (SQLException | RuntimeException | Error exception) {
+                    synchronized (STATE_LOCK) {
+                        if (activeLoad == load) {
+                            activeLoad = null;
+                        }
+                    }
+                    throw exception;
+                }
+
+                synchronized (STATE_LOCK) {
+                    if (activeLoad == load) {
+                        activeLoad = null;
+                    }
+                    if (observedCacheGeneration != cacheGeneration) {
                         continue;
                     }
-                    IndexSnapshot snapshot = loaded.get(source);
-                    long startRowId = resultSet.getLong("start_rowid");
-                    long endRowId = resultSet.getLong("end_rowid");
-                    int rowCount = resultSet.getInt("row_count");
-                    byte[] chunks = DatabaseUtils.getBytes(resultSet, "chunks");
-                    byte[] entities = DatabaseUtils.getBytes(resultSet, "entities");
+                    Map<Source, IndexSnapshot> merged = appendSegments(loaded, load.committedSegments);
+                    if (merged == null) {
+                        continue;
+                    }
+                    indexCache = new IndexCache(key, merged);
+                    return merged;
+                }
+            }
+            return Collections.emptyMap();
+        }
+        finally {
+            SNAPSHOT_LOAD_LOCK.unlock();
+        }
+    }
+
+    private static Map<Source, IndexSnapshot> loadSnapshots(Connection connection, String prefix) throws SQLException {
+        DuckDBConnection duckDBConnection = connection.unwrap(DuckDBConnection.class);
+        if (duckDBConnection == null) {
+            throw new SQLException("DuckDB connection required");
+        }
+
+        Map<Source, List<Segment>> segmentsBySource = new EnumMap<>(Source.class);
+        Map<Source, Boolean> usableBySource = new EnumMap<>(Source.class);
+        for (Source source : Source.values()) {
+            segmentsBySource.put(source, new ArrayList<>());
+            usableBySource.put(source, Boolean.TRUE);
+        }
+
+        String sql = "SELECT table_id,start_rowid,end_rowid,row_count,chunks,entities FROM " + prefix + "duckdb_spatial_index";
+        try (Connection loadConnection = duckDBConnection.duplicate(); Statement statement = loadConnection.createStatement()) {
+            statement.execute("SET jdbc_stream_results=true");
+            try (ResultSet resultSet = statement.executeQuery(sql)) {
+                while (resultSet.next()) {
+                    Source source = Source.fromId(resultSet.getInt(1));
+                    if (source == null || !usableBySource.get(source)) {
+                        continue;
+                    }
+                    long startRowId = resultSet.getLong(2);
+                    long endRowId = resultSet.getLong(3);
+                    int rowCount = resultSet.getInt(4);
+                    byte[] chunks = resultSet.getBytes(5);
+                    byte[] entities = resultSet.getBytes(6);
                     if (startRowId <= 0L || endRowId < startRowId || rowCount <= 0 || chunks == null || chunks.length != FILTER_BYTES
                             || (source.entityRows && (entities == null || entities.length != FILTER_BYTES))
                             || (!source.entityRows && entities != null && entities.length != FILTER_BYTES)) {
-                        snapshot.usable = false;
+                        usableBySource.put(source, Boolean.FALSE);
+                        segmentsBySource.get(source).clear();
                         continue;
                     }
-                    snapshot.segments.add(new Segment(startRowId, endRowId, rowCount, new BloomFilter(chunks), entities == null ? null : new BloomFilter(entities)));
-                    snapshot.lastIndexedRowId = Math.max(snapshot.lastIndexedRowId, endRowId);
+                    segmentsBySource.get(source).add(new Segment(startRowId, endRowId, rowCount, new BloomFilter(chunks), entities == null ? null : new BloomFilter(entities)));
                 }
             }
+        }
 
-            synchronized (STATE_LOCK) {
-                if (observedGeneration == runtimeGeneration) {
-                    indexCache = new IndexCache(key, loaded);
-                    return indexCache.snapshots;
+        Map<Source, IndexSnapshot> loaded = new EnumMap<>(Source.class);
+        for (Source source : Source.values()) {
+            if (!usableBySource.get(source)) {
+                loaded.put(source, new IndexSnapshot(Collections.emptyList(), 0L, false));
+                continue;
+            }
+            List<Segment> segments = segmentsBySource.get(source);
+            segments.sort(Comparator.comparingLong(segment -> segment.startRowId));
+            long lastIndexedRowId = 0L;
+            for (Segment segment : segments) {
+                lastIndexedRowId = Math.max(lastIndexedRowId, segment.endRowId);
+            }
+            loaded.put(source, new IndexSnapshot(segments, lastIndexedRowId, true));
+        }
+        return loaded;
+    }
+
+    private static boolean hasTable(Connection connection, String table) throws SQLException {
+        String sql = "SELECT 1 FROM duckdb_tables() WHERE schema_name = current_schema() AND table_name = ? LIMIT 1";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, table);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next();
+            }
+        }
+    }
+
+    private static boolean hasIndexGaps(Connection connection, String indexTable) throws SQLException {
+        String sql = "SELECT 1 FROM ("
+                + "SELECT start_rowid,end_rowid,row_count,LAG(end_rowid,1,0) OVER (PARTITION BY table_id ORDER BY start_rowid) AS previous_end "
+                + "FROM " + indexTable
+                + ") WHERE start_rowid>0 AND end_rowid>=start_rowid AND row_count>0 "
+                + "AND previous_end>=0 AND previous_end<" + Long.MAX_VALUE + " AND start_rowid>previous_end+1 LIMIT 1";
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
+            return resultSet.next();
+        }
+    }
+
+    private static Map<Source, List<IndexSpan>> loadIndexSpans(Connection connection, String indexTable) throws SQLException {
+        Map<Source, List<IndexSpan>> spansBySource = new EnumMap<>(Source.class);
+        Map<Source, Boolean> usableBySource = new EnumMap<>(Source.class);
+        for (Source source : Source.values()) {
+            spansBySource.put(source, new ArrayList<>());
+            usableBySource.put(source, Boolean.TRUE);
+        }
+
+        String sql = "SELECT table_id,start_rowid,end_rowid,row_count,octet_length(chunks),octet_length(entities) FROM " + indexTable;
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
+            while (resultSet.next()) {
+                Source source = Source.fromId(resultSet.getInt(1));
+                if (source == null || !usableBySource.get(source)) {
+                    continue;
+                }
+                long startRowId = resultSet.getLong(2);
+                long endRowId = resultSet.getLong(3);
+                int rowCount = resultSet.getInt(4);
+                int chunkBytes = resultSet.getInt(5);
+                boolean chunksNull = resultSet.wasNull();
+                int entityBytes = resultSet.getInt(6);
+                boolean entitiesNull = resultSet.wasNull();
+                if (startRowId <= 0L || endRowId < startRowId || rowCount <= 0 || chunksNull || chunkBytes != FILTER_BYTES
+                        || (source.entityRows && (entitiesNull || entityBytes != FILTER_BYTES))
+                        || (!source.entityRows && !entitiesNull && entityBytes != FILTER_BYTES)) {
+                    usableBySource.put(source, Boolean.FALSE);
+                    spansBySource.get(source).clear();
+                    continue;
+                }
+                spansBySource.get(source).add(new IndexSpan(startRowId, endRowId));
+            }
+        }
+
+        for (Source source : Source.values()) {
+            if (!usableBySource.get(source)) {
+                spansBySource.remove(source);
+                continue;
+            }
+            spansBySource.get(source).sort(Comparator.comparingLong(span -> span.startRowId));
+        }
+        return spansBySource;
+    }
+
+    private static void collectSourceGapAdjustments(Connection connection, Source source, String tableName, List<IndexSpan> spans,
+            List<Integer> adjustedTables, List<Long> oldStarts, List<Long> newStarts) throws SQLException {
+        int gapCount = 0;
+        long lastIndexedRowId = 0L;
+        for (IndexSpan span : spans) {
+            if (span.startRowId <= lastIndexedRowId) {
+                return;
+            }
+            if (lastIndexedRowId < Long.MAX_VALUE && span.startRowId > lastIndexedRowId + 1L) {
+                gapCount++;
+            }
+            lastIndexedRowId = span.endRowId;
+        }
+        if (gapCount == 0) {
+            return;
+        }
+
+        long minimumRowId = 0L;
+        long maximumRowId = 0L;
+        boolean hasRows = false;
+        try (Statement statement = connection.createStatement();
+                ResultSet resultSet = statement.executeQuery("SELECT MIN(rowid),MAX(rowid) FROM " + tableName)) {
+            if (resultSet.next()) {
+                minimumRowId = resultSet.getLong(1);
+                if (!resultSet.wasNull()) {
+                    maximumRowId = resultSet.getLong(2);
+                    hasRows = !resultSet.wasNull();
+                }
+            }
+        }
+
+        BitSet candidateGaps = new BitSet(spans.size());
+        if (hasRows) {
+            long previousEnd = 0L;
+            for (int index = 0; index < spans.size(); index++) {
+                IndexSpan span = spans.get(index);
+                if (previousEnd < Long.MAX_VALUE && span.startRowId > previousEnd + 1L) {
+                    long gapStart = previousEnd + 1L;
+                    long gapEnd = span.startRowId - 1L;
+                    if (gapEnd >= minimumRowId && gapStart <= maximumRowId) {
+                        candidateGaps.set(index);
+                    }
+                }
+                previousEnd = span.endRowId;
+            }
+        }
+
+        BitSet nonEmptyGaps = candidateGaps.isEmpty() ? null : findNonEmptyGaps(connection, tableName, spans, candidateGaps);
+        if (nonEmptyGaps != null && nonEmptyGaps.cardinality() == gapCount) {
+            return;
+        }
+
+        long previousEnd = 0L;
+        for (int index = 0; index < spans.size(); index++) {
+            IndexSpan span = spans.get(index);
+            if (previousEnd < Long.MAX_VALUE && span.startRowId > previousEnd + 1L && (nonEmptyGaps == null || !nonEmptyGaps.get(index))) {
+                adjustedTables.add(source.id);
+                oldStarts.add(span.startRowId);
+                newStarts.add(previousEnd + 1L);
+            }
+            previousEnd = span.endRowId;
+        }
+    }
+
+    private static BitSet findNonEmptyGaps(Connection connection, String tableName, List<IndexSpan> spans, BitSet candidateGaps) throws SQLException {
+        BitSet nonEmptyGaps = new BitSet(spans.size());
+        List<Integer> batchIndices = new ArrayList<>();
+        List<Long> batchBuckets = new ArrayList<>();
+        List<Long> batchStarts = new ArrayList<>();
+        List<Long> batchEnds = new ArrayList<>();
+        long batchMinimumStart = Long.MAX_VALUE;
+        long batchMaximumEnd = Long.MIN_VALUE;
+        PreparedStatement bucketStatement = null;
+        PreparedStatement wideStatement = null;
+        try {
+            try {
+                for (int index = candidateGaps.nextSetBit(0); index >= 0; index = candidateGaps.nextSetBit(index + 1)) {
+                    long previousEnd = index == 0 ? 0L : spans.get(index - 1).endRowId;
+                    IndexSpan span = spans.get(index);
+                    long gapStart = previousEnd + 1L;
+                    long gapEnd = span.startRowId - 1L;
+                    long startBucket = gapStart >>> GAP_BUCKET_SHIFT;
+                    long endBucket = gapEnd >>> GAP_BUCKET_SHIFT;
+                    if (endBucket - startBucket > MAXIMUM_GAP_BUCKETS) {
+                        if (wideStatement == null) {
+                            wideStatement = connection.prepareStatement("SELECT 1 FROM " + tableName + " WHERE rowid BETWEEN ? AND ? LIMIT 1");
+                        }
+                        wideStatement.setLong(1, gapStart);
+                        wideStatement.setLong(2, gapEnd);
+                        try (ResultSet resultSet = wideStatement.executeQuery()) {
+                            if (resultSet.next()) {
+                                nonEmptyGaps.set(index);
+                            }
+                        }
+                    }
+                    else {
+                        if (batchIndices.size() + (int) (endBucket - startBucket + 1L) > GAP_QUERY_BATCH_SIZE && !batchIndices.isEmpty()) {
+                            bucketStatement = executeGapBatch(connection, tableName, bucketStatement, batchIndices, batchBuckets, batchStarts, batchEnds, batchMinimumStart, batchMaximumEnd, nonEmptyGaps);
+                            batchMinimumStart = Long.MAX_VALUE;
+                            batchMaximumEnd = Long.MIN_VALUE;
+                        }
+                        batchMinimumStart = Math.min(batchMinimumStart, gapStart);
+                        batchMaximumEnd = Math.max(batchMaximumEnd, gapEnd);
+                        for (long bucket = startBucket; bucket <= endBucket; bucket++) {
+                            batchIndices.add(index);
+                            batchBuckets.add(bucket);
+                            batchStarts.add(gapStart);
+                            batchEnds.add(gapEnd);
+                        }
+                    }
+                }
+                if (!batchIndices.isEmpty()) {
+                    bucketStatement = executeGapBatch(connection, tableName, bucketStatement, batchIndices, batchBuckets, batchStarts, batchEnds, batchMinimumStart, batchMaximumEnd, nonEmptyGaps);
+                }
+                return nonEmptyGaps;
+            }
+            finally {
+                if (bucketStatement != null) {
+                    bucketStatement.close();
+                }
+            }
+        }
+        finally {
+            if (wideStatement != null) {
+                wideStatement.close();
+            }
+        }
+    }
+
+    private static PreparedStatement executeGapBatch(Connection connection, String tableName, PreparedStatement statement,
+            List<Integer> indices, List<Long> buckets, List<Long> starts, List<Long> ends,
+            long minimumStart, long maximumEnd, BitSet nonEmptyGaps) throws SQLException {
+        if (statement == null) {
+            statement = connection.prepareStatement(
+                    "WITH gaps AS (SELECT UNNEST(?::INTEGER[]) AS idx,UNNEST(?::BIGINT[]) AS bucket,UNNEST(?::BIGINT[]) AS start_rowid,UNNEST(?::BIGINT[]) AS end_rowid) "
+                            + "SELECT DISTINCT g.idx FROM " + tableName + " t "
+                            + "JOIN gaps g ON (CAST(t.rowid AS BIGINT)>>" + GAP_BUCKET_SHIFT + ")=g.bucket AND t.rowid BETWEEN g.start_rowid AND g.end_rowid "
+                            + "WHERE t.rowid BETWEEN ? AND ?");
+        }
+        Array indexArray = connection.createArrayOf("INTEGER", indices.toArray());
+        Array bucketArray = connection.createArrayOf("BIGINT", buckets.toArray());
+        Array startArray = connection.createArrayOf("BIGINT", starts.toArray());
+        Array endArray = connection.createArrayOf("BIGINT", ends.toArray());
+        try {
+            statement.setArray(1, indexArray);
+            statement.setArray(2, bucketArray);
+            statement.setArray(3, startArray);
+            statement.setArray(4, endArray);
+            statement.setLong(5, minimumStart);
+            statement.setLong(6, maximumEnd);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    nonEmptyGaps.set(resultSet.getInt(1));
+                }
+            }
+        }
+        finally {
+            freeArray(indexArray);
+            freeArray(bucketArray);
+            freeArray(startArray);
+            freeArray(endArray);
+            indices.clear();
+            buckets.clear();
+            starts.clear();
+            ends.clear();
+        }
+        return statement;
+    }
+
+    private static void rebuildSpatialIndex(Connection connection, String indexTable, List<Integer> adjustedTables,
+            List<Long> oldStarts, List<Long> newStarts) throws SQLException {
+        String stagingTable = indexTable + "_new";
+        boolean ownTransaction = connection.getAutoCommit();
+        if (ownTransaction) {
+            connection.setAutoCommit(false);
+        }
+        Throwable primaryFailure = null;
+        try {
+            try (Statement statement = connection.createStatement()) {
+                statement.executeUpdate("DROP TABLE IF EXISTS " + stagingTable);
+                statement.executeUpdate("CREATE TABLE " + stagingTable + " " + TABLE_DEFINITION);
+            }
+            String copySql = "WITH adjustments AS ("
+                    + "SELECT UNNEST(?::INTEGER[]) AS table_id,UNNEST(?::BIGINT[]) AS old_start_rowid,UNNEST(?::BIGINT[]) AS new_start_rowid) "
+                    + "INSERT INTO " + stagingTable + " (table_id,start_rowid,end_rowid,row_count,chunks,entities) "
+                    + "SELECT s.table_id,COALESCE(a.new_start_rowid,s.start_rowid),s.end_rowid,s.row_count,s.chunks,s.entities "
+                    + "FROM " + indexTable + " s LEFT JOIN adjustments a ON s.table_id=a.table_id AND s.start_rowid=a.old_start_rowid";
+            Array tableArray = connection.createArrayOf("INTEGER", adjustedTables.toArray());
+            Array oldStartArray = connection.createArrayOf("BIGINT", oldStarts.toArray());
+            Array newStartArray = connection.createArrayOf("BIGINT", newStarts.toArray());
+            try (PreparedStatement statement = connection.prepareStatement(copySql)) {
+                statement.setArray(1, tableArray);
+                statement.setArray(2, oldStartArray);
+                statement.setArray(3, newStartArray);
+                statement.executeUpdate();
+            }
+            finally {
+                freeArray(tableArray);
+                freeArray(oldStartArray);
+                freeArray(newStartArray);
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.executeUpdate("DROP TABLE " + indexTable);
+                statement.executeUpdate("ALTER TABLE " + stagingTable + " RENAME TO " + indexTable);
+            }
+            if (ownTransaction) {
+                connection.commit();
+            }
+        }
+        catch (SQLException | RuntimeException | Error exception) {
+            primaryFailure = exception;
+            if (ownTransaction) {
+                try {
+                    connection.rollback();
+                }
+                catch (SQLException rollbackFailure) {
+                    exception.addSuppressed(rollbackFailure);
+                }
+            }
+            throw exception;
+        }
+        finally {
+            if (ownTransaction) {
+                try {
+                    connection.setAutoCommit(true);
+                }
+                catch (SQLException autoCommitFailure) {
+                    if (primaryFailure != null) {
+                        primaryFailure.addSuppressed(autoCommitFailure);
+                    }
+                    else {
+                        throw autoCommitFailure;
+                    }
                 }
             }
         }
     }
 
-    private static void addRange(List<RowRange> ranges, long start, long end) {
+    private static void freeArray(Array array) {
+        if (array != null) {
+            try {
+                array.free();
+            }
+            catch (SQLException ignored) {
+            }
+        }
+    }
+
+    private static Map<Source, IndexSnapshot> appendSegments(Map<Source, IndexSnapshot> snapshots, List<PendingSegment> committedSegments) {
+        if (committedSegments.isEmpty()) {
+            return snapshots;
+        }
+        Map<Source, List<Segment>> updatedSegments = null;
+        Map<Source, Long> updatedLastRowIds = null;
+        for (PendingSegment pending : committedSegments) {
+            IndexSnapshot existing = snapshots.get(pending.source);
+            if (existing == null) {
+                return null;
+            }
+            if (!existing.usable) {
+                continue;
+            }
+            long currentLastRowId = updatedLastRowIds != null && updatedLastRowIds.containsKey(pending.source)
+                    ? updatedLastRowIds.get(pending.source)
+                    : existing.lastIndexedRowId;
+            Segment segment = pending.segment;
+            if (segment.endRowId <= currentLastRowId) {
+                continue;
+            }
+            if (segment.startRowId <= currentLastRowId) {
+                return null;
+            }
+            if (updatedSegments == null) {
+                updatedSegments = new EnumMap<>(Source.class);
+                updatedLastRowIds = new EnumMap<>(Source.class);
+            }
+            List<Segment> copy = updatedSegments.get(pending.source);
+            if (copy == null) {
+                copy = new ArrayList<>(existing.segments.size() + committedSegments.size());
+                copy.addAll(existing.segments);
+                updatedSegments.put(pending.source, copy);
+            }
+            copy.add(segment);
+            updatedLastRowIds.put(pending.source, segment.endRowId);
+        }
+        if (updatedSegments == null) {
+            return snapshots;
+        }
+        Map<Source, IndexSnapshot> updated = new EnumMap<>(snapshots);
+        for (Map.Entry<Source, List<Segment>> entry : updatedSegments.entrySet()) {
+            Source source = entry.getKey();
+            updated.put(source, new IndexSnapshot(entry.getValue(), updatedLastRowIds.get(source), true));
+        }
+        return updated;
+    }
+
+    private static long addRange(List<RowRange> ranges, long start, long end, long pendingGapRows) {
         if (!ranges.isEmpty()) {
             RowRange previous = ranges.get(ranges.size() - 1);
             if (previous.end == Long.MAX_VALUE || start <= previous.end + 1L) {
                 previous.end = Math.max(previous.end, end);
-                return;
+                return 0L;
             }
         }
-        ranges.add(new RowRange(start, end));
+        ranges.add(new RowRange(start, end, ranges.isEmpty() ? 0L : pendingGapRows));
+        return 0L;
     }
 
     private static String databaseKey(Connection connection, String prefix) throws SQLException {
@@ -475,6 +1023,7 @@ public final class DuckDBSpatialIndex {
         private final long generation;
         private final WriterState state;
         private final Map<Source, List<PendingLocation>> generatedRows = new EnumMap<>(Source.class);
+        private final List<PendingSegment> writtenSegments = new ArrayList<>();
         private boolean flushed;
         private boolean metadataChanged;
 
@@ -509,24 +1058,41 @@ public final class DuckDBSpatialIndex {
                     state.accumulator(source).add(rowId++, location.worldId, location.x, location.z, location.entitySpawnRowId);
                 }
             }
-            metadataChanged = state.writeCompleted(connection, prefix);
+            writtenSegments.clear();
+            metadataChanged = state.writeCompleted(connection, prefix, writtenSegments);
             flushed = true;
         }
 
         void publish() {
             synchronized (STATE_LOCK) {
-                if (!flushed || !key.equals(runtimeKey) || generation != runtimeGeneration) {
-                    runtimeKey = null;
-                    runtimeState = null;
-                    indexCache = null;
+                if (!key.equals(runtimeKey) || generation != runtimeGeneration) {
+                    if (key.equals(runtimeKey)) {
+                        runtimeKey = null;
+                        runtimeState = null;
+                    }
+                    invalidateCache(key);
                     runtimeGeneration++;
+                    return;
+                }
+                if (!flushed) {
                     return;
                 }
                 runtimeState = state;
                 runtimeGeneration++;
                 if (metadataChanged) {
-                    indexCache = null;
+                    publishCommittedSegments(key, writtenSegments);
                 }
+            }
+        }
+
+        void abandon() {
+            synchronized (STATE_LOCK) {
+                if (key.equals(runtimeKey)) {
+                    runtimeKey = null;
+                    runtimeState = null;
+                }
+                invalidateCache(key);
+                runtimeGeneration++;
             }
         }
     }
@@ -552,7 +1118,7 @@ public final class DuckDBSpatialIndex {
         }
 
         public void writeCompleted(Connection connection) throws SQLException {
-            if (state.writeCompleted(connection, prefix)) {
+            if (state.writeCompleted(connection, prefix, null)) {
                 invalidateExternalWrite(connection, prefix);
             }
         }
@@ -564,7 +1130,7 @@ public final class DuckDBSpatialIndex {
             }
             Accumulator accumulator = state.accumulator(source);
             accumulator.finish();
-            boolean changed = state.writeCompleted(connection, prefix);
+            boolean changed = state.writeCompleted(connection, prefix, null);
             if (changed) {
                 invalidateExternalWrite(connection, prefix);
             }
@@ -579,9 +1145,7 @@ public final class DuckDBSpatialIndex {
                 runtimeKey = null;
                 runtimeState = null;
             }
-            if (indexCache != null && key.equals(indexCache.key)) {
-                indexCache = null;
-            }
+            invalidateCache(key);
             runtimeGeneration++;
         }
     }
@@ -620,7 +1184,7 @@ public final class DuckDBSpatialIndex {
             return copy;
         }
 
-        private boolean writeCompleted(Connection connection, String prefix) throws SQLException {
+        private boolean writeCompleted(Connection connection, String prefix, List<PendingSegment> writtenSegments) throws SQLException {
             List<PendingSegment> pending = new ArrayList<>();
             for (Map.Entry<Source, Accumulator> entry : accumulators.entrySet()) {
                 for (Segment segment : entry.getValue().completed) {
@@ -652,6 +1216,9 @@ public final class DuckDBSpatialIndex {
             for (Accumulator accumulator : accumulators.values()) {
                 accumulator.completed.clear();
             }
+            if (writtenSegments != null) {
+                writtenSegments.addAll(pending);
+            }
             return true;
         }
     }
@@ -662,6 +1229,7 @@ public final class DuckDBSpatialIndex {
         private final List<Segment> completed = new ArrayList<>();
         private BloomFilter chunks = new BloomFilter();
         private BloomFilter entities;
+        private long coveredThrough = -1L;
         private long startRowId;
         private long endRowId;
         private int rowCount;
@@ -676,14 +1244,14 @@ public final class DuckDBSpatialIndex {
         }
 
         private void add(long rowId, int worldId, int x, int z, Integer entitySpawnRowId) throws SQLException {
-            if (rowId <= 0L || (rowCount > 0 && rowId <= endRowId)) {
+            if (rowId <= 0L || (rowCount > 0 ? rowId <= endRowId : coveredThrough >= 0L && rowId <= coveredThrough)) {
                 throw new SQLException("DuckDB spatial index rows must have increasing positive row IDs");
             }
             if (source.entityRows && (entitySpawnRowId == null || entitySpawnRowId <= 0)) {
                 throw new SQLException("DuckDB entity row-group metadata requires a positive entity spawn row ID");
             }
             if (rowCount == 0) {
-                startRowId = rowId;
+                startRowId = coveredThrough >= 0L ? coveredThrough + 1L : rowId;
             }
             endRowId = rowId;
             rowCount++;
@@ -701,6 +1269,9 @@ public final class DuckDBSpatialIndex {
                 return;
             }
             completed.add(new Segment(startRowId, endRowId, rowCount, chunks, entities));
+            if (coveredThrough >= 0L) {
+                coveredThrough = endRowId;
+            }
             chunks = new BloomFilter();
             entities = source.entityRows ? new BloomFilter() : null;
             startRowId = 0L;
@@ -713,6 +1284,7 @@ public final class DuckDBSpatialIndex {
             copy.completed.addAll(completed);
             copy.chunks = chunks.copy();
             copy.entities = entities == null ? null : entities.copy();
+            copy.coveredThrough = coveredThrough;
             copy.startRowId = startRowId;
             copy.endRowId = endRowId;
             copy.rowCount = rowCount;
@@ -765,6 +1337,17 @@ public final class DuckDBSpatialIndex {
         }
     }
 
+    private static final class IndexSpan {
+
+        private final long startRowId;
+        private final long endRowId;
+
+        private IndexSpan(long startRowId, long endRowId) {
+            this.startRowId = startRowId;
+            this.endRowId = endRowId;
+        }
+    }
+
     private static final class Segment {
 
         private final long startRowId;
@@ -808,6 +1391,16 @@ public final class DuckDBSpatialIndex {
         }
     }
 
+    private static final class SnapshotLoad {
+
+        private final String key;
+        private final List<PendingSegment> committedSegments = new ArrayList<>();
+
+        private SnapshotLoad(String key) {
+            this.key = key;
+        }
+    }
+
     private static final class IndexCache {
 
         private final String key;
@@ -821,19 +1414,27 @@ public final class DuckDBSpatialIndex {
 
     private static final class IndexSnapshot {
 
-        private final List<Segment> segments = new ArrayList<>();
-        private long lastIndexedRowId;
-        private boolean usable = true;
+        private final List<Segment> segments;
+        private final long lastIndexedRowId;
+        private final boolean usable;
+
+        private IndexSnapshot(List<Segment> segments, long lastIndexedRowId, boolean usable) {
+            this.segments = segments;
+            this.lastIndexedRowId = lastIndexedRowId;
+            this.usable = usable;
+        }
     }
 
     static final class RowRange {
 
         private final long start;
         private long end;
+        private final long gapBefore;
 
-        private RowRange(long start, long end) {
+        private RowRange(long start, long end, long gapBefore) {
             this.start = start;
             this.end = end;
+            this.gapBefore = gapBefore;
         }
     }
 
