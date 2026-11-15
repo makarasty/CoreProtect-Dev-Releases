@@ -73,8 +73,8 @@ public class ContainerLogger extends Queue {
                 return;
             }
 
-            String loggingContainerId = HopperTransactionUtils.getLoggingId(player, location);
-            String transactingChestId = HopperTransactionUtils.getTransactionId(location);
+            String loggingContainerId = HopperTransactionUtils.getLoggingId(player, type, location);
+            String transactingChestId = HopperTransactionUtils.getTransactionId(player, type, location);
             List<ItemStack[]> oldList = ConfigHandler.oldContainer.get(loggingContainerId);
             if (oldList == null || oldList.isEmpty()) {
                 return;
@@ -143,7 +143,7 @@ public class ContainerLogger extends Queue {
             if (forceState != null) {
                 newInventory = ItemUtils.getContainerState(forceState);
             }
-            else {
+            else if (type != Material.ENDER_CHEST) {
                 long snapshotMark = HopperTransactionUtils.peekSnapshotMark(transactingChestId, loggingContainerId);
                 newInventory = HopperTransactionUtils.applyPendingChanges(newInventory, transactingChestId, snapshotMark);
             }
@@ -157,7 +157,9 @@ public class ContainerLogger extends Queue {
                 }
                 oldList.remove(0);
                 ConfigHandler.oldContainer.put(loggingContainerId, oldList);
-                HopperTransactionUtils.consumeSnapshot(transactingChestId, loggingContainerId);
+                if (type != Material.ENDER_CHEST) {
+                    HopperTransactionUtils.consumeSnapshot(transactingChestId, loggingContainerId);
+                }
                 if ("#hopper".equals(player)) {
                     String hopperPush = HopperTransactionUtils.getHopperPushId(location);
                     ConfigHandler.hopperSuccess.remove(hopperPush);
@@ -183,7 +185,9 @@ public class ContainerLogger extends Queue {
             }
             oldList.remove(0);
             ConfigHandler.oldContainer.put(loggingContainerId, oldList);
-            HopperTransactionUtils.consumeSnapshot(transactingChestId, loggingContainerId);
+            if (type != Material.ENDER_CHEST) {
+                HopperTransactionUtils.consumeSnapshot(transactingChestId, loggingContainerId);
+            }
             if (prepared != null) {
                 prepared.log(preparedStmtContainer, preparedStmtItems, batchCount, player, true);
             }

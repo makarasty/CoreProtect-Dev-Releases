@@ -4,6 +4,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.plugin.IllegalPluginAccessException;
 
 import net.coreprotect.CoreProtect;
@@ -28,11 +29,18 @@ final class ContainerTransactionDispatcher {
     }
 
     static void submit(Location location, Runnable task) {
+        submit(null, null, location, task);
+    }
+
+    static void submit(String user, Material type, Location location, Runnable task) {
         if (location == null || location.getWorld() == null || task == null) {
             return;
         }
+        if (type == Material.ENDER_CHEST && user == null) {
+            return;
+        }
 
-        String transactionId = HopperTransactionUtils.getTransactionId(location);
+        String transactionId = HopperTransactionUtils.getTransactionId(user, type, location);
         Stripe stripe = STRIPES[(transactionId.hashCode() & Integer.MAX_VALUE) % STRIPE_COUNT];
         stripe.submit(task);
     }

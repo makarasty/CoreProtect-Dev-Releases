@@ -16,10 +16,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.inventory.ItemStack;
 
 public final class HopperTransactionUtils {
 
+    private static final String ENDER_CHEST_PREFIX = "#ender_chest.";
     private static final long APPLY_ALL_MARK = -1L;
     private static final int TRANSACTION_LOCK_COUNT = 256;
 
@@ -38,8 +40,29 @@ public final class HopperTransactionUtils {
         return location.getWorld().getUID().toString() + "." + location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ();
     }
 
+    public static String getTransactionId(String user, Material type, Location location) {
+        if (type == Material.ENDER_CHEST) {
+            return ENDER_CHEST_PREFIX + user.toLowerCase(Locale.ROOT);
+        }
+        return getTransactionId(location);
+    }
+
+    public static String getViewerGroupId(String user, Material type, Location location) {
+        if (type == Material.ENDER_CHEST) {
+            return ENDER_CHEST_PREFIX + user.toLowerCase(Locale.ROOT);
+        }
+        return getLoggingIdSuffix(location);
+    }
+
     public static String getLoggingId(String user, Location location) {
         return getLoggingId(user, getLoggingIdSuffix(location));
+    }
+
+    public static String getLoggingId(String user, Material type, Location location) {
+        if (type == Material.ENDER_CHEST) {
+            return ENDER_CHEST_PREFIX + user.toLowerCase(Locale.ROOT) + getLoggingIdSuffix(location);
+        }
+        return getLoggingId(user, location);
     }
 
     public static String getLoggingId(String user, String locationSuffix) {

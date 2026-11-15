@@ -57,11 +57,11 @@ class ContainerTransactionProcess {
             return;
         }
 
-        String transactingChestId = HopperTransactionUtils.getTransactionId(location);
-        String loggingChestIdSuffix = HopperTransactionUtils.getLoggingIdSuffix(location);
-        String loggingChestId = HopperTransactionUtils.getLoggingId(user, loggingChestIdSuffix);
+        String transactingChestId = HopperTransactionUtils.getTransactionId(user, type, location);
+        String viewerGroupId = HopperTransactionUtils.getViewerGroupId(user, type, location);
+        String loggingChestId = HopperTransactionUtils.getLoggingId(user, type, location);
         HopperTransactionUtils.synchronizeTransaction(transactingChestId,
-                () -> processTransaction(preparedStmtContainer, preparedStmtItems, batchCount, processId, id, type, forceData, user, inventory, location, transactingChestId, loggingChestIdSuffix, loggingChestId));
+                () -> processTransaction(preparedStmtContainer, preparedStmtItems, batchCount, processId, id, type, forceData, user, inventory, location, transactingChestId, viewerGroupId, loggingChestId));
     }
 
     private static void processTransaction(ConsumerWriteBatch preparedStmtContainer, ConsumerWriteBatch preparedStmtItems, int batchCount, int processId, int id, Material type, int forceData, String user, Object inventory,
@@ -134,13 +134,13 @@ class ContainerTransactionProcess {
         HopperTransactionUtils.removeOwner(transactionId, loggingId);
     }
 
-    static void discard(int processId, int failedIndex, int forceData, String user, Location location) {
+    static void discard(int processId, int failedIndex, Material type, int forceData, String user, Location location) {
         if (location.getWorld() == null) {
             return;
         }
-        String transactionId = HopperTransactionUtils.getTransactionId(location);
-        String locationSuffix = HopperTransactionUtils.getLoggingIdSuffix(location);
-        String loggingId = HopperTransactionUtils.getLoggingId(user, locationSuffix);
+        String transactionId = HopperTransactionUtils.getTransactionId(user, type, location);
+        String locationSuffix = HopperTransactionUtils.getViewerGroupId(user, type, location);
+        String loggingId = HopperTransactionUtils.getLoggingId(user, type, location);
         HopperTransactionUtils.synchronizeTransaction(transactionId, () -> {
             List<ItemStack[]> old = ConfigHandler.oldContainer.get(loggingId);
             if (old == null || old.isEmpty()) {
@@ -167,7 +167,9 @@ class ContainerTransactionProcess {
                 if (snapshotIndex < forceSize) {
                     Queue.pollForceContainer(loggingId, snapshotIndex);
                 }
-                HopperTransactionUtils.consumeSnapshot(transactionId, loggingId, snapshotIndex);
+                if (type != Material.ENDER_CHEST) {
+                    HopperTransactionUtils.consumeSnapshot(transactionId, loggingId, snapshotIndex);
+                }
             }
             if (old.isEmpty()) {
                 clearContainerTransaction(transactionId, locationSuffix, loggingId);

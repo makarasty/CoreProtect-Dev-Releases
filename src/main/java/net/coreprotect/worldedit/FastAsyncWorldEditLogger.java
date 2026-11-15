@@ -12,7 +12,6 @@ import com.fastasyncworldedit.core.queue.IChunkSet;
 import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldedit.extension.platform.Actor;
 import com.sk89q.worldedit.extent.Extent;
-import com.sk89q.worldedit.math.BlockVector3;
 import com.sk89q.worldedit.world.World;
 import com.sk89q.worldedit.world.block.BaseBlock;
 import com.sk89q.worldedit.world.block.BlockState;
@@ -22,16 +21,16 @@ import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 
 final class FastAsyncWorldEditLogger implements IBatchProcessor {
+    private static final int ORDINAL_CACHE_SIZE = Character.MAX_VALUE + 1;
     private static final ProcessorScope SCOPE = resolveScope();
+    private static volatile BlockStateConversion[] conversions;
     private final Actor actor;
     private final World eventWorld;
-    private final Extent extent;
     private final org.bukkit.World world;
 
     FastAsyncWorldEditLogger(Actor actor, World world, Extent extent) {
         this.actor = actor;
         this.eventWorld = world;
-        this.extent = extent;
         this.world = BukkitAdapter.adapt(world);
     }
 
@@ -46,6 +45,7 @@ final class FastAsyncWorldEditLogger implements IBatchProcessor {
             return set;
         }
 
+        BlockStateConversion[] cached = conversions();
         int chunkX = chunk.getX() << 4;
         int chunkZ = chunk.getZ() << 4;
         for (int layer = get.getMinSectionPosition(); layer <= get.getMaxSectionPosition(); layer++) {
@@ -72,15 +72,14 @@ final class FastAsyncWorldEditLogger implements IBatchProcessor {
                 int x = index & 15;
                 int y = (layer << 4) + (index >> 8);
                 int z = (index >> 4) & 15;
-                BlockState oldBlock = BlockState.getFromOrdinal(oldOrdinal);
-                BlockState newBlock = BlockState.getFromOrdinal(newOrdinal);
-                Material oldType = BukkitAdapter.adapt(oldBlock.getBlockType());
-                BlockData oldBlockData = BukkitAdapter.adapt(oldBlock);
-                BlockVector3 position = BlockVector3.at(chunkX + x, y, chunkZ + z);
+                BlockStateConversion oldConversion = conversion(cached, oldOrdinal);
+                BlockStateConversion newConversion = conversion(cached, newOrdinal);
+                Material oldType = oldConversion.getMaterial();
+                BlockData oldBlockData = oldConversion.getBlockData();
                 Location location = new Location(world, chunkX + x, y, chunkZ + z);
                 BaseBlock baseBlock = WorldEditLogger.needsBaseBlock(oldType, config) ? get.getFullBlock(x, y, z) : null;
-                org.bukkit.block.BlockState lowerHalf = WorldEditLogger.isLoggedTopHalf(oldType, oldBlockData) ? getLowerHalf(get, set, x, y, z, chunkX + x, chunkZ + z, oldBlockData) : null;
-                WorldEditLogger.postProcess(extent, actor, position, location, newBlock, baseBlock, oldType, oldBlockData, null, false, lowerHalf);
+                org.bukkit.block.BlockState lowerHalf = WorldEditLogger.isLoggedTopHalf(oldType, oldBlockData) ? getLowerHalf(get, set, cached, x, y, z, chunkX + x, chunkZ + z, oldBlockData) : null;
+                WorldEditLogger.postProcess(actor, location, baseBlock, oldType, oldBlockData, oldConversion.getDataString(), newConversion.getMaterial(), newConversion.getBlockData(), newConversion.getDataString(), null, false, lowerHalf);
             }
         }
         return set;
@@ -90,7 +89,7 @@ final class FastAsyncWorldEditLogger implements IBatchProcessor {
      * The matching lower half of a top half as this edit leaves it, read from the chunk data the processor already holds instead of the world.
      * Null when the block below is not that lower half, or when the edit changes it too, since its own row then covers the double block.
      */
-    private org.bukkit.block.BlockState getLowerHalf(IChunkGet get, IChunkSet set, int x, int y, int z, int worldX, int worldZ, BlockData topHalf) {
+    private org.bukkit.block.BlockState getLowerHalf(IChunkGet get, IChunkSet set, BlockStateConversion[] cached, int x, int y, int z, int worldX, int worldZ, BlockData topHalf) {
         int lowerY = y - 1;
         int layer = lowerY >> 4;
         if (layer < get.getMinSectionPosition()) {
@@ -108,12 +107,31 @@ final class FastAsyncWorldEditLogger implements IBatchProcessor {
             return null;
         }
 
-        BlockData blockData = BukkitAdapter.adapt(BlockState.getFromOrdinal(ordinal));
-        if (!WorldEditLogger.isOtherHalf(topHalf, blockData)) {
+        BlockStateConversion conversion = conversion(cached, ordinal);
+        if (!WorldEditLogger.isOtherHalf(topHalf, conversion.getBlockData())) {
             return null;
         }
 
-        return new WorldEditBlockState(new Location(world, worldX, lowerY, worldZ), blockData.getMaterial(), blockData);
+        return new WorldEditBlockState(new Location(world, worldX, lowerY, worldZ), conversion.getMaterial(), conversion.getBlockData());
+    }
+
+    private static BlockStateConversion[] conversions() {
+        BlockStateConversion[] cached = conversions;
+        if (cached == null) {
+            cached = new BlockStateConversion[ORDINAL_CACHE_SIZE];
+            conversions = cached;
+        }
+        return cached;
+    }
+
+    private static BlockStateConversion conversion(BlockStateConversion[] cached, int ordinal) {
+        BlockState state = BlockState.getFromOrdinal(ordinal);
+        BlockStateConversion conversion = cached[ordinal];
+        if (conversion == null || conversion.getState() != state) {
+            conversion = BlockStateConversion.of(state);
+            cached[ordinal] = conversion;
+        }
+        return conversion;
     }
 
     @Override
