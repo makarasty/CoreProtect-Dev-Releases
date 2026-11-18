@@ -12,21 +12,37 @@ public final class TickTimeMonitor {
     private static final double ESTIMATE_FLOOR_MILLIS = 38.0D;
     private static final double ESTIMATE_DECAY_MILLIS = 3.0D;
 
+    private static final Object MONITOR_LOCK = new Object();
+
     private static volatile double estimatedTickTime = -1.0D;
-    private static long lastSampleTime = -1L;
+    private static volatile long lastSampleTime = -1L;
+    private static volatile Object monitorTask;
 
     private TickTimeMonitor() {
         throw new IllegalStateException("TickTimeMonitor class");
     }
 
     public static void initialize(CoreProtect plugin) {
-        if (ConfigHandler.isFolia || PaperAdapter.ADAPTER.getAverageTickTime(plugin.getServer()) >= 0.0D) {
-            return;
-        }
+        synchronized (MONITOR_LOCK) {
+            shutdown();
+            if (plugin == null || ConfigHandler.isFolia || (PaperAdapter.ADAPTER != null && PaperAdapter.ADAPTER.getAverageTickTime(plugin.getServer()) >= 0.0D)) {
+                return;
+            }
 
-        estimatedTickTime = -1.0D;
-        lastSampleTime = -1L;
-        Scheduler.scheduleSyncRepeatingTask(plugin, TickTimeMonitor::recordSample, null, MONITOR_INTERVAL_TICKS, MONITOR_INTERVAL_TICKS);
+            monitorTask = Scheduler.scheduleSyncRepeatingTask(plugin, TickTimeMonitor::recordSample, null, MONITOR_INTERVAL_TICKS, MONITOR_INTERVAL_TICKS);
+        }
+    }
+
+    public static void shutdown() {
+        synchronized (MONITOR_LOCK) {
+            Object task = monitorTask;
+            monitorTask = null;
+            if (task != null) {
+                Scheduler.cancelTask(task);
+            }
+            estimatedTickTime = -1.0D;
+            lastSampleTime = -1L;
+        }
     }
 
     public static double getEstimatedTickTime() {
