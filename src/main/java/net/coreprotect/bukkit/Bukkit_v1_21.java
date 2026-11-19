@@ -1,8 +1,7 @@
 package net.coreprotect.bukkit;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -21,6 +20,8 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.BlockType;
 import org.bukkit.block.data.BlockData;
+import org.bukkit.block.data.Directional;
+import org.bukkit.block.data.SideChaining;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Painting;
 import org.bukkit.event.Event;
@@ -33,6 +34,7 @@ import org.bukkit.inventory.ItemStack;
 
 
 import net.coreprotect.model.BlockGroup;
+import net.coreprotect.utility.AdapterMethods;
 import net.coreprotect.utility.BlockTypeUtils;
 
 /**
@@ -45,9 +47,8 @@ import net.coreprotect.utility.BlockTypeUtils;
  */
 public class Bukkit_v1_21 extends Bukkit_v1_20 {
 
-    public static Set<Material> COPPER_CHESTS = new HashSet<>(Arrays.asList());
-    public static Set<Material> SHELVES = new HashSet<>(Arrays.asList());
-    public static Set<Material> BUNDLES = new HashSet<>(Arrays.asList());
+    private final Set<Material> copperChests = blockMaterials("copper_chests", "COPPER_CHEST");
+    private final Set<Material> shelves = blockMaterials("wooden_shelves", "_SHELF");
 
     @Override
     public boolean hasBodyItemSlot() {
@@ -70,8 +71,8 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
      */
     public Bukkit_v1_21() {
         initializeBlockGroups();
+        BlockGroup.LANTERNS.addAll(blockMaterials("lanterns", "COPPER_LANTERN"));
         initializeTrapdoorBlocks();
-        initializeBundles();
         BlockGroup.INTERACT_BLOCKS.addAll(copperChestMaterials());
         BlockGroup.CONTAINERS.addAll(copperChestMaterials());
         BlockGroup.UPDATE_STATE.addAll(copperChestMaterials());
@@ -83,15 +84,34 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
      * Updates container, interaction, and update state blocks with new 1.21 blocks.
      */
     private void initializeBlockGroups() {
-        addToBlockGroupIfMissing(Material.CRAFTER, BlockGroup.CONTAINERS);
-        addToBlockGroupIfMissing(Material.CRAFTER, BlockGroup.INTERACT_BLOCKS);
-        addToBlockGroupIfMissing(Material.CRAFTER, BlockGroup.UPDATE_STATE);
+        BlockGroup.CONTAINERS.add(Material.CRAFTER);
+        BlockGroup.INTERACT_BLOCKS.add(Material.CRAFTER);
+        BlockGroup.UPDATE_STATE.add(Material.CRAFTER);
 
         Material paleHangingMoss = Material.getMaterial("PALE_HANGING_MOSS");
         if (paleHangingMoss != null) {
-            addToBlockGroupIfMissing(paleHangingMoss, BlockGroup.TRACK_BOTTOM);
-            addToBlockGroupIfMissing(paleHangingMoss, BlockGroup.VERTICAL_BOTTOM);
-            addToBlockGroupIfMissing(paleHangingMoss, BlockGroup.NON_ATTACHABLE);
+            BlockGroup.TRACK_BOTTOM.add(paleHangingMoss);
+            BlockGroup.VERTICAL_BOTTOM.add(paleHangingMoss);
+            BlockGroup.NON_ATTACHABLE.add(paleHangingMoss);
+        }
+
+        Material resinClump = Material.getMaterial("RESIN_CLUMP");
+        if (resinClump != null) {
+            BlockGroup.TRACK_ANY.add(resinClump);
+            BlockGroup.NON_ATTACHABLE.add(resinClump);
+        }
+
+        Material copperTorch = Material.getMaterial("COPPER_TORCH");
+        if (copperTorch != null) {
+            BlockGroup.TRACK_TOP.add(copperTorch);
+            BlockGroup.NON_ATTACHABLE.add(copperTorch);
+            BlockGroup.UPDATE_STATE.add(copperTorch);
+        }
+        Material copperWallTorch = Material.getMaterial("COPPER_WALL_TORCH");
+        if (copperWallTorch != null) {
+            BlockGroup.TRACK_SIDE.add(copperWallTorch);
+            BlockGroup.NON_ATTACHABLE.add(copperWallTorch);
+            BlockGroup.UPDATE_STATE.add(copperWallTorch);
         }
     }
 
@@ -107,40 +127,8 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
             }
 
             // Add to interaction blocks if not already present
-            addToBlockGroupIfMissing(value, BlockGroup.INTERACT_BLOCKS);
-            addToBlockGroupIfMissing(value, BlockGroup.SAFE_INTERACT_BLOCKS);
-        }
-    }
-
-    /**
-     * Initializes the bundles group to enable the ability to roll back dyed bundles correctly.
-     * It needs to check whether dyed bundles exist because they were added in 1.21.2.
-     */
-    public void initializeBundles(){
-        if (BUNDLES.isEmpty()) {
-            Tag<Material> bundleTag = getMaterialTag(Tag.REGISTRY_ITEMS, "bundles");
-            if (bundleTag != null) {
-                BUNDLES.addAll(bundleTag.getValues());
-            }
-
-            if (BUNDLES.isEmpty()) {
-                addMaterialsEndingWith(BUNDLES, "_BUNDLE");
-            }
-            BUNDLES.add(Material.BUNDLE);
-        }
-    }
-
-    /**
-     * Helper method to add a block to a block group if it's not already present.
-     * 
-     * @param block
-     *            The block to add
-     * @param group
-     *            The group to add the block to
-     */
-    private void addToBlockGroupIfMissing(Material block, Set<Material> group) {
-        if (!group.contains(block)) {
-            group.add(block);
+            BlockGroup.INTERACT_BLOCKS.add(value);
+            BlockGroup.SAFE_INTERACT_BLOCKS.add(value);
         }
     }
 
@@ -209,7 +197,16 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
      */
     @Override
     public Object getRegistryKey(Object value) {
-        return ((Keyed) value).getKey().toString();
+        if (!(value instanceof Keyed)) {
+            return null;
+        }
+        try {
+            NamespacedKey key = ((Keyed) value).getKey();
+            return key == null ? null : key.toString();
+        }
+        catch (IllegalStateException e) {
+            return null;
+        }
     }
 
 
@@ -226,9 +223,15 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
     @SuppressWarnings({ "unchecked", "rawtypes" })
     @Override
     public Object getRegistryValue(String key, Object tClass) {
+        if (key == null || !(tClass instanceof Class<?>) || !Keyed.class.isAssignableFrom((Class<?>) tClass)) {
+            return null;
+        }
         NamespacedKey namespacedKey = NamespacedKey.fromString(key);
-        // return RegistryAccess.registryAccess().getRegistry(RegistryKey.CAT_VARIANT).get((NamespacedKey)value);
-        return Bukkit.getRegistry((Class) tClass).get(namespacedKey);
+        if (namespacedKey == null) {
+            return null;
+        }
+        Registry<?> registry = Bukkit.getRegistry((Class) tClass);
+        return registry == null ? null : registry.get(namespacedKey);
     }
 
     @Override
@@ -302,12 +305,10 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
      */
     @Override
     public void setWolfVariant(org.bukkit.entity.Wolf wolf, Object value) {
-        if (value instanceof String) {
-            value = getRegistryValue((String) value, org.bukkit.entity.Wolf.Variant.class);
+        org.bukkit.entity.Wolf.Variant variant = resolveRegistryValue(this, value, org.bukkit.entity.Wolf.Variant.class);
+        if (variant != null) {
+            wolf.setVariant(variant);
         }
-        org.bukkit.entity.Wolf.Variant variant = (org.bukkit.entity.Wolf.Variant) value;
-        wolf.setVariant(variant);
-
     }
 
     @Override
@@ -317,60 +318,35 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
 
     @Override
     public boolean isCopperChest(Material material) {
-        if (COPPER_CHESTS.contains(material) && material != Material.CHEST) {
-            return true;
-        }
-
-        return false;
+        return material != Material.CHEST && copperChests.contains(material);
     }
 
     @Override
     public boolean isShelf(Material material) {
-        return SHELVES.contains(material);
+        return shelves.contains(material);
     }
-
-    @Override
-    public boolean isBundle(Material material) {
-        return BUNDLES.contains(material);
-    }
-
 
     @Override
     public Set<Material> copperChestMaterials() {
-        if (COPPER_CHESTS.isEmpty()) {
-            Material copperChest = Material.getMaterial("COPPER_CHEST");
-            if (copperChest == null) {
-                COPPER_CHESTS.add(Material.CHEST);
-            }
-            else {
-                COPPER_CHESTS.add(Material.getMaterial("COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("EXPOSED_COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("WEATHERED_COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("OXIDIZED_COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("WAXED_COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("WAXED_EXPOSED_COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("WAXED_WEATHERED_COPPER_CHEST"));
-                COPPER_CHESTS.add(Material.getMaterial("WAXED_OXIDIZED_COPPER_CHEST"));
-            }
-        }
-
-        return COPPER_CHESTS;
+        return copperChests;
     }
 
     @Override
     public Set<Material> shelfMaterials() {
-        if (SHELVES.isEmpty()) {
-            Tag<Material> shelfTag = getMaterialTag(Tag.REGISTRY_BLOCKS, "wooden_shelves");
-            if (shelfTag != null) {
-                SHELVES.addAll(shelfTag.getValues());
-            }
+        return shelves;
+    }
 
-            if (SHELVES.isEmpty()) {
-                addMaterialsEndingWith(SHELVES, "_SHELF");
-            }
+    static Set<Material> blockMaterials(String tagName, String fallbackSuffix) {
+        Set<Material> materials = new HashSet<>();
+        Tag<Material> tag = getMaterialTag(Tag.REGISTRY_BLOCKS, tagName);
+        if (tag != null) {
+            materials.addAll(tag.getValues());
+            materials.remove(null);
         }
-
-        return SHELVES;
+        if (materials.isEmpty()) {
+            addMaterialsEndingWith(materials, fallbackSuffix);
+        }
+        return Collections.unmodifiableSet(materials);
     }
 
     @Override
@@ -433,23 +409,21 @@ public class Bukkit_v1_21 extends Bukkit_v1_20 {
     }
 
     private static BlockFace getShelfFacing(BlockData blockData) {
-        Object facing = invokeNoArgumentMethod(blockData, "getFacing");
-        return facing instanceof BlockFace ? (BlockFace) facing : null;
+        return blockData instanceof Directional ? ((Directional) blockData).getFacing() : null;
     }
 
     private static String getShelfSideChain(BlockData blockData) {
-        Object sideChain = invokeNoArgumentMethod(blockData, "getSideChain");
-        return sideChain == null ? null : sideChain.toString();
-    }
-
-    private static Object invokeNoArgumentMethod(Object target, String methodName) {
-        if (target == null) {
-            return null;
-        }
-
         try {
-            Method method = target.getClass().getMethod(methodName);
-            return method.invoke(target);
+            if (blockData instanceof SideChaining) {
+                SideChaining.ChainPart part = ((SideChaining) blockData).getSideChain();
+                return part == null ? null : part.name();
+            }
+        }
+        catch (LinkageError e) {
+        }
+        try {
+            Object part = AdapterMethods.invokeNoArguments(blockData, "getSideChain");
+            return part instanceof Enum<?> ? ((Enum<?>) part).name() : null;
         }
         catch (ReflectiveOperationException | LinkageError e) {
             return null;

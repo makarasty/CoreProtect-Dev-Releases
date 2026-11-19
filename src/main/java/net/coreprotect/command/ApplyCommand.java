@@ -17,13 +17,18 @@ import net.coreprotect.utility.ErrorReporter;
 
 public class ApplyCommand {
     protected static void runCommand(CommandSender user, Command command, boolean permission, String[] args) {
+        if (!permission) {
+            Chat.sendMessage(user, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
+            return;
+        }
+
         try {
-            if (ConfigHandler.lastRollback.get(user.getName()) != null) {
-                List<Object> list = ConfigHandler.lastRollback.get(user.getName());
-                long startTime = (Long) list.get(0);
-                long endTime = (Long) list.get(1);
-                String[] savedArgs = (String[]) list.get(2);
-                Location location = (Location) list.get(3);
+            List<Object> savedRollback = ConfigHandler.lastRollback.get(user.getName());
+            if (savedRollback != null) {
+                long startTime = (Long) savedRollback.get(0);
+                long endTime = (Long) savedRollback.get(1);
+                String[] savedArgs = (String[]) savedRollback.get(2);
+                Location location = (Location) savedRollback.get(3);
                 List<String> appliedArgs = new ArrayList<>(savedArgs.length);
                 if (savedArgs.length > 0) {
                     appliedArgs.add(savedArgs[0]);
@@ -37,17 +42,12 @@ public class ApplyCommand {
                         appliedArgs.add(savedArgs[i]);
                     }
                 }
-                if (!valid) {
-                    Chat.sendMessage(user, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_ROLLBACK, Selector.FIRST));
-                }
-                else {
-                    ConfigHandler.lastRollback.remove(user.getName());
-                    RollbackRestoreCommand.runCommand(user, command, permission, appliedArgs.toArray(new String[0]), location, startTime, endTime);
+                if (valid) {
+                    RollbackRestoreCommand.runCommand(user, command, permission, appliedArgs.toArray(new String[0]), location, startTime, endTime, savedRollback);
+                    return;
                 }
             }
-            else {
-                Chat.sendMessage(user, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_ROLLBACK, Selector.FIRST));
-            }
+            Chat.sendMessage(user, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_ROLLBACK, Selector.FIRST));
         }
         catch (Exception e) {
             ErrorReporter.report(e);

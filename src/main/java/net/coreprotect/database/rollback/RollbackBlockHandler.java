@@ -218,7 +218,8 @@ public class RollbackBlockHandler extends Queue {
                         if ((changeType == Material.NETHER_PORTAL) || removeBlockData instanceof MultipleFacing || removeBlockData instanceof Snow || removeBlockData instanceof Stairs || removeBlockData instanceof RedstoneWire || removeBlockData instanceof Chest) {
                             physics = true;
                         }
-                        else if (removeBlockData instanceof Bisected && !(removeBlockData instanceof TrapDoor)) {
+                        else if (removeBlockData instanceof Bisected && !(removeBlockData instanceof TrapDoor)
+                                && !BukkitAdapter.ADAPTER.isSingleBlockPitcherCrop(removeBlockData)) {
                             Bisected bisected = (Bisected) removeBlockData;
                             Location bisectLocation = block.getLocation().clone();
                             if (bisected.getHalf() == Half.TOP) {
@@ -265,7 +266,7 @@ public class RollbackBlockHandler extends Queue {
                         // e.printStackTrace();
                     }
                 }
-                else if ((rowType == Material.SKELETON_SKULL) || (rowType == Material.SKELETON_WALL_SKULL) || (rowType == Material.WITHER_SKELETON_SKULL) || (rowType == Material.WITHER_SKELETON_WALL_SKULL) || (rowType == Material.ZOMBIE_HEAD) || (rowType == Material.ZOMBIE_WALL_HEAD) || (rowType == Material.PLAYER_HEAD) || (rowType == Material.PLAYER_WALL_HEAD) || (rowType == Material.CREEPER_HEAD) || (rowType == Material.CREEPER_WALL_HEAD) || (rowType == Material.DRAGON_HEAD) || (rowType == Material.DRAGON_WALL_HEAD)) { // skull
+                else if (BlockUtils.isSkull(rowType)) {
                     BlockUtils.prepareTypeAndData(chunkChanges, block, rowType, blockData, false);
                     if (rowData > 0) {
                         Queue.queueSkullUpdate(rowUser, block.getState(), rowData);
@@ -443,7 +444,8 @@ public class RollbackBlockHandler extends Queue {
                     ChestTool.updateDoubleChest(block, blockData, true);
                     return countBlock;
                 }
-                else if (rowType != Material.AIR && rawBlockData instanceof Bisected && !(rawBlockData instanceof Stairs || rawBlockData instanceof TrapDoor)) {
+                else if (rowType != Material.AIR && rawBlockData instanceof Bisected && !(rawBlockData instanceof Stairs || rawBlockData instanceof TrapDoor)
+                        && !BukkitAdapter.ADAPTER.isSingleBlockPitcherCrop(rawBlockData)) {
                     Bisected bisected = (Bisected) rawBlockData;
                     Bisected bisectData = (Bisected) rawBlockData.clone();
                     Location bisectLocation = block.getLocation().clone();

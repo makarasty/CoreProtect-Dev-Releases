@@ -34,6 +34,35 @@ public class LocationParser {
             "r:"
     };
 
+    public static String stripCoordinatePrefix(String argument) {
+        return ParserUtils.stripPrefix(argument, COORDINATE_PREFIXES);
+    }
+
+    public static boolean isValidBlockCoordinates(String spec) {
+        return parseCoordinateValues(spec) != null;
+    }
+
+    public static String findInvalidCoordinateArgument(String[] arguments) {
+        for (int index = 1; index < arguments.length; index++) {
+            String raw = arguments[index];
+            String value = stripCoordinatePrefix(ParserUtils.normalize(raw));
+            if (value == null) {
+                continue;
+            }
+            if (value.isEmpty() && index + 1 < arguments.length) {
+                value = ParserUtils.normalize(arguments[++index]);
+            }
+            if (!isValidBlockCoordinates(value)) {
+                return raw;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isBlockCoordinate(double coordinate) {
+        return coordinate >= Integer.MIN_VALUE && coordinate < Integer.MAX_VALUE + 1.0;
+    }
+
     /**
      * Parse location from command sender and command arguments
      * 
@@ -44,6 +73,10 @@ public class LocationParser {
      * @return The parsed location
      */
     public static Location parseLocation(CommandSender user, String[] argumentArray) {
+        return parseLocation(user, argumentArray, WorldParser.parseWorld(argumentArray, true, true));
+    }
+
+    public static Location parseLocation(CommandSender user, String[] argumentArray, int worldId) {
         Location location = null;
         if (user instanceof Player) {
             location = ((Player) user).getLocation();
@@ -52,7 +85,7 @@ public class LocationParser {
             location = ((BlockCommandSender) user).getBlock().getLocation();
         }
 
-        return parseCoordinates(location, argumentArray, WorldParser.parseWorld(argumentArray, true, true));
+        return parseCoordinates(location, argumentArray, worldId);
     }
 
     /**
@@ -67,61 +100,64 @@ public class LocationParser {
      * @return The modified location
      */
     public static Location parseCoordinates(Location location, String[] inputArguments, int worldId) {
+        World targetWorld = worldId > 0 ? Bukkit.getWorld(WorldUtils.getWorldName(worldId)) : null;
         int next = 0;
         for (int index = 1; index < inputArguments.length; index++) {
             String argument = ParserUtils.normalize(inputArguments[index]);
-            if (ParserUtils.equalsAny(argument, COORDINATE_PREFIXES)) {
+            String stripped = stripCoordinatePrefix(argument);
+            if ("".equals(stripped)) {
                 next = 2;
                 continue;
             }
 
-            String stripped = ParserUtils.stripPrefix(argument, COORDINATE_PREFIXES);
             if (next == 2 || stripped != null) {
-                String coordSpec = (stripped != null) ? stripped : argument;
                 next = 0;
+                double[] parsed = parseCoordinateValues(stripped != null ? stripped : argument);
+                if (parsed == null) {
+                    continue;
+                }
 
-                String[] parts = coordSpec.split(",", -1);
-                if (parts.length == 2 || parts.length == 3) {
-                    double[] parsed = new double[parts.length];
-                    boolean valid = true;
-                    for (int i = 0; i < parts.length; i++) {
-                        String part = parts[i].trim();
-                        if (!ParserUtils.isSignedDecimal(part)) {
-                            valid = false;
-                            break;
-                        }
-                        double value = Double.parseDouble(part);
-                        if (!Double.isFinite(value)) {
-                            valid = false;
-                            break;
-                        }
-                        parsed[i] = value;
-                    }
+                double x = parsed[0];
+                double y = (parsed.length == 3) ? parsed[1] : (location != null ? location.getY() : 0.0);
+                double z = parsed[parsed.length - 1];
 
-                    if (valid) {
-                        double x = parsed[0];
-                        double y = (parts.length == 3) ? parsed[1] : (location != null ? location.getY() : 0.0);
-                        double z = (parts.length == 3) ? parsed[2] : parsed[1];
-
-                        World targetWorld = null;
-                        if (worldId > 0) {
-                            targetWorld = Bukkit.getWorld(WorldUtils.getWorldName(worldId));
-                        }
-                        if (targetWorld != null) {
-                            location = new Location(targetWorld, x, clampY(targetWorld, y), z);
-                        }
-                        else if (location != null) {
-                            World world = location.getWorld();
-                            location = new Location(world, x, clampY(world, y), z, location.getYaw(), location.getPitch());
-                        }
-                    }
+                if (targetWorld != null) {
+                    location = new Location(targetWorld, x, clampY(targetWorld, y), z);
+                }
+                else if (location != null) {
+                    World world = location.getWorld();
+                    location = new Location(world, x, clampY(world, y), z, location.getYaw(), location.getPitch());
                 }
             }
             else {
                 next = 0;
             }
         }
+        if (targetWorld != null && location != null && !targetWorld.equals(location.getWorld())) {
+            return new Location(targetWorld, location.getX(), clampY(targetWorld, location.getY()), location.getZ(), location.getYaw(), location.getPitch());
+        }
         return location;
+    }
+
+    private static double[] parseCoordinateValues(String spec) {
+        String[] parts = spec.split(",", -1);
+        if (parts.length != 2 && parts.length != 3) {
+            return null;
+        }
+
+        double[] coordinates = new double[parts.length];
+        for (int index = 0; index < parts.length; index++) {
+            String part = parts[index].trim();
+            if (!ParserUtils.isSignedDecimal(part)) {
+                return null;
+            }
+            double coordinate = Double.parseDouble(part);
+            if (!Double.isFinite(coordinate)) {
+                return null;
+            }
+            coordinates[index] = coordinate;
+        }
+        return isBlockCoordinate(coordinates[0]) && isBlockCoordinate(coordinates[coordinates.length - 1]) ? coordinates : null;
     }
 
     private static double clampY(World world, double y) {
@@ -156,6 +192,9 @@ public class LocationParser {
         for (int index = 1; index < inputArguments.length; index++) {
             String argument = ParserUtils.normalize(inputArguments[index]);
             if (ParserUtils.equalsAny(argument, RADIUS_PREFIXES)) {
+                if (next == 2) {
+                    return new Integer[] { -1 };
+                }
                 next = 2;
                 continue;
             }
@@ -204,7 +243,7 @@ public class LocationParser {
                     }
 
                     if (!validRadius) {
-                        radius = new Integer[] { -1 };
+                        return new Integer[] { -1 };
                     }
                     else if (location != null) {
                         Integer xmin = clampToInt((long) location.getBlockX() - r_x);
@@ -226,7 +265,7 @@ public class LocationParser {
                 next = 0;
             }
         }
-        return radius;
+        return next == 2 ? new Integer[] { -1 } : radius;
     }
 
     private static int clampToInt(long value) {

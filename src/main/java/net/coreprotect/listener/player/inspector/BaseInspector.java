@@ -1,6 +1,7 @@
 package net.coreprotect.listener.player.inspector;
 
 import java.sql.Connection;
+import java.sql.Statement;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -13,11 +14,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.bukkit.entity.Player;
 
 import net.coreprotect.config.ConfigHandler;
+import net.coreprotect.consumer.Consumer;
 import net.coreprotect.database.Database;
 import net.coreprotect.language.Phrase;
 import net.coreprotect.listener.channel.PluginChannelHandshakeListener;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.Color;
+import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.LookupThrottle;
 
 public abstract class BaseInspector {
@@ -45,9 +48,10 @@ public abstract class BaseInspector {
         lookupExecutor = executor;
     }
 
-    protected void startInspection(Player player, Runnable inspection) {
+    protected void startInspection(Player player, InspectionTask inspection) {
+        LookupThrottle.Claim claim;
         try {
-            acquireInspection(player);
+            claim = acquireInspection(player);
         }
         catch (InspectionException e) {
             Chat.sendMessage(player, e.getMessage());
@@ -59,34 +63,43 @@ public abstract class BaseInspector {
             handshakeListener.verifyNetworkingPermission(player);
         }
 
-        runLookup(player, () -> {
+        runLookup(player, claim, () -> {
             try {
                 inspection.run();
             }
-            finally {
-                LookupThrottle.release(player.getName());
+            catch (InspectionException e) {
+                Chat.sendMessage(player, e.getMessage());
+            }
+            catch (Exception e) {
+                ErrorReporter.report(e);
             }
         });
+    }
+
+    protected final void withStatement(Player player, InspectionQuery query) throws Exception {
+        try (Connection connection = getDatabaseConnection(player); Statement statement = connection.createStatement()) {
+            query.run(connection, statement);
+        }
     }
 
     /**
      * Runs a lookup on the shared inspector threads. The caller holds the player's throttle slot and the lookup
      * releases it, so it is only released here when the lookup is rejected or discarded at shutdown.
      */
-    public static void runLookup(Player player, Runnable lookup) {
+    public static void runLookup(Player player, LookupThrottle.Claim claim, Runnable lookup) {
         ThreadPoolExecutor executor = lookupExecutor;
         try {
             if (executor == null) {
                 throw new RejectedExecutionException();
             }
-            executor.execute(new InspectorLookup(player.getName(), lookup));
+            executor.execute(new InspectorLookup(player.getName(), claim, lookup));
         }
         catch (RejectedExecutionException e) {
-            LookupThrottle.release(player.getName());
+            claim.close();
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
         }
         catch (RuntimeException | Error e) {
-            LookupThrottle.release(player.getName());
+            claim.close();
             throw e;
         }
     }
@@ -130,18 +143,20 @@ public abstract class BaseInspector {
     private static void discardQueued(List<Runnable> queued) {
         for (Runnable runnable : queued) {
             if (runnable instanceof InspectorLookup) {
-                LookupThrottle.release(((InspectorLookup) runnable).playerName);
+                ((InspectorLookup) runnable).claim.close();
             }
         }
     }
 
     private static final class InspectorLookup implements Runnable {
         private final String playerName;
+        private final LookupThrottle.Claim claim;
         private final Runnable lookup;
         private volatile Thread thread;
 
-        private InspectorLookup(String playerName, Runnable lookup) {
+        private InspectorLookup(String playerName, LookupThrottle.Claim claim, Runnable lookup) {
             this.playerName = playerName;
+            this.claim = claim;
             this.lookup = lookup;
         }
 
@@ -150,7 +165,7 @@ public abstract class BaseInspector {
             thread = Thread.currentThread();
             activeLookups.add(this);
             try {
-                lookup.run();
+                claim.runLookup(lookup);
             }
             finally {
                 activeLookups.remove(this);
@@ -158,8 +173,17 @@ public abstract class BaseInspector {
         }
     }
 
-    private void acquireInspection(Player player) throws InspectionException {
-        if (ConfigHandler.converterRunning) {
+    private LookupThrottle.Claim acquireInspection(Player player) throws InspectionException {
+        requireInspectionAvailable();
+        LookupThrottle.Claim claim = LookupThrottle.acquire(player.getName(), 100);
+        if (claim == null) {
+            throw new InspectionException(Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
+        }
+        return claim;
+    }
+
+    private static void requireInspectionAvailable() throws InspectionException {
+        if (ConfigHandler.converterRunning || ConfigHandler.migrationRunning) {
             throw new InspectionException(Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.UPGRADE_IN_PROGRESS));
         }
 
@@ -167,18 +191,29 @@ public abstract class BaseInspector {
             throw new InspectionException(Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.PURGE_IN_PROGRESS));
         }
 
-        if (!LookupThrottle.tryAcquire(player.getName(), 100)) {
+        if (Consumer.isDatabaseReloadBlocked()) {
             throw new InspectionException(Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
         }
     }
 
     protected Connection getDatabaseConnection(Player player) throws Exception {
+        requireInspectionAvailable();
         Connection connection = Database.getConnection(true);
         if (connection == null) {
             throw new InspectionException(Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
         }
 
         return connection;
+    }
+
+    @FunctionalInterface
+    protected interface InspectionTask {
+        void run() throws Exception;
+    }
+
+    @FunctionalInterface
+    protected interface InspectionQuery {
+        void run(Connection connection, Statement statement) throws Exception;
     }
 
     public static class InspectionException extends Exception {

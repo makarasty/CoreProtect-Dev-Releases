@@ -198,7 +198,6 @@ public class CacheHandler implements Runnable {
                                 break;
                             case 2:
                                 cache = CacheHandler.pistonCache;
-                                scanTime = 900; // 15 minutes
                                 break;
                             case 3:
                                 cache = CacheHandler.spreadCache;
@@ -263,7 +262,15 @@ public class CacheHandler implements Runnable {
             return;
         }
         int timestamp = (int) (System.currentTimeMillis() / 1000L) - scanTimeSeconds;
-        cache.values().removeIf(value -> value == null || value.length < 1 || value[0] < timestamp);
+        cache.forEach((key, value) -> {
+            if (isDuplicateExpired(value, timestamp)) {
+                cache.computeIfPresent(key, (currentKey, currentValue) -> isDuplicateExpired(currentValue, timestamp) ? null : currentValue);
+            }
+        });
+    }
+
+    private static boolean isDuplicateExpired(int[] value, int cutoff) {
+        return value.length == 0 || value[0] < cutoff;
     }
 
     /**

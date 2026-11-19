@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -21,6 +22,7 @@ import org.bukkit.entity.Player;
 
 import net.coreprotect.command.parser.ActionParser;
 import net.coreprotect.command.parser.ParserUtils;
+import net.coreprotect.command.parser.TimeParser;
 import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
@@ -32,6 +34,7 @@ import net.coreprotect.language.Phrase;
 import net.coreprotect.language.Selector;
 import net.coreprotect.model.action.EntityActionFilter;
 import net.coreprotect.model.action.LookupActions;
+import net.coreprotect.model.lookup.StandardLookupRequest;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.Color;
 import net.coreprotect.utility.WorldUtils;
@@ -40,9 +43,21 @@ import net.coreprotect.utility.LookupThrottle;
 
 public class RollbackRestoreCommand {
     public static void runCommand(CommandSender player, Command command, boolean permission, String[] args, Location argLocation, long forceStart, long forceEnd) {
+        runCommand(player, command, permission, args, argLocation, forceStart, forceEnd, null);
+    }
+
+    public static void runCommand(CommandSender player, Command command, boolean permission, String[] args, Location argLocation, long forceStart, long forceEnd, List<Object> savedRollback) {
         String lookupOnlyFlag = findLookupOnlyFlag(args);
         if (lookupOnlyFlag != null) {
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.INVALID_PARAMETER, lookupOnlyFlag));
+            return;
+        }
+        if (!CommandParser.validateCoordinates(player, args)) {
+            return;
+        }
+        TimeParser.ParsedTime requestedTime = TimeParser.parseDurationArguments(args);
+        if (requestedTime.invalidArgument() != null) {
+            Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.INVALID_PARAMETER, requestedTime.invalidArgument()));
             return;
         }
 
@@ -57,8 +72,8 @@ public class RollbackRestoreCommand {
         List<Object> argBlocks = CommandParser.parseRestricted(player, args, argAction);
         Map<Object, Boolean> argExclude = CommandParser.parseExcluded(player, args, argAction);
         List<String> argExcludeUsers = CommandParser.parseExcludedUsers(player, args);
-        String ts = CommandParser.parseTimeString(args);
-        long[] argTime = CommandParser.parseTime(args);
+        String ts = requestedTime.description();
+        long[] argTime = requestedTime.sortedSeconds();
         long startTime = argTime[0];
         long endTime = argTime[1];
         int argWid = CommandParser.parseWorld(args, true, true);
@@ -75,7 +90,7 @@ public class RollbackRestoreCommand {
             return;
         }
 
-        if (ConfigHandler.converterRunning) {
+        if (ConfigHandler.converterRunning || ConfigHandler.migrationRunning) {
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.UPGRADE_IN_PROGRESS));
             return;
         }
@@ -112,12 +127,10 @@ public class RollbackRestoreCommand {
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.ROLLBACK_IN_PROGRESS));
             return;
         }
-        if (ConfigHandler.lookupThrottle.get(player.getName()) != null) {
-            Object[] lookupThrottle = ConfigHandler.lookupThrottle.get(player.getName());
-            if ((boolean) lookupThrottle[0] || ((System.currentTimeMillis() - (long) lookupThrottle[1])) < 100) {
-                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
-                return;
-            }
+        Object[] lookupThrottle = ConfigHandler.lookupThrottle.get(player.getName());
+        if (lookupThrottle != null && ((boolean) lookupThrottle[0] || System.currentTimeMillis() - (long) lookupThrottle[1] < 100)) {
+            Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
+            return;
         }
         if (preview > 1 && forceStart <= 0) {
             preview = 1;
@@ -132,7 +145,7 @@ public class RollbackRestoreCommand {
 
             int DEFAULT_RADIUS = Config.getGlobal().DEFAULT_RADIUS;
             boolean exactEntityContainer = argUsers.contains("#container") && ConfigHandler.lookupEntityContainer.get(player.getName()) != null;
-            if ((player instanceof Player || player instanceof BlockCommandSender) && argRadius == null && DEFAULT_RADIUS > 0 && !forceglobal && !argAction.contains(LookupActions.ITEM) && !argAction.contains(5) && !exactEntityContainer) {
+            if ((player instanceof Player || player instanceof BlockCommandSender) && argRadius == null && DEFAULT_RADIUS > 0 && !forceglobal && !argAction.contains(LookupActions.ITEM) && !argAction.contains(LookupActions.INSPECT_CONTAINER) && !exactEntityContainer) {
                 Location location = lo;
                 int xmin = location.getBlockX() - DEFAULT_RADIUS;
                 int xmax = location.getBlockX() + DEFAULT_RADIUS;
@@ -236,38 +249,24 @@ public class RollbackRestoreCommand {
                         return;
                     }
 
-                    boolean valid = false;
-                    if (ConfigHandler.lookupType.get(player.getName()) != null) {
-                        int lookupType = ConfigHandler.lookupType.get(player.getName());
-                        if (lookupType == 1) {
-                            valid = true;
-                        }
-                        else if (lookupType == 5) {
-                            List<String> lookupUsers = ConfigHandler.lookupUlist.get(player.getName());
-                            if (lookupUsers != null && lookupUsers.contains("#container")) {
-                                valid = true;
-                            }
-                        }
-                    }
-                    if (valid) {
+                    StandardLookupRequest.Scope container = LookupCommand.containerScope(player.getName());
+                    if (container != null) {
                         if (preview > 0) {
                             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.PREVIEW_TRANSACTION, Selector.FIRST));
                             return;
                         }
                         else {
-                            String lcommand = ConfigHandler.lookupCommand.get(player.getName());
-                            String[] data = lcommand.split("\\.");
-                            x = Integer.parseInt(data[0]);
-                            y = Integer.parseInt(data[1]);
-                            z = Integer.parseInt(data[2]);
-                            wid = Integer.parseInt(data[3]);
+                            x = container.x;
+                            y = container.y;
+                            z = container.z;
+                            wid = container.worldId;
                             String containerWorldName = WorldUtils.getWorldName(wid);
                             World containerWorld = Bukkit.getServer().getWorld(containerWorldName);
                             if (containerWorld == null) {
                                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.WORLD_NOT_FOUND, containerWorldName));
                                 return;
                             }
-                            argAction.add(5);
+                            argAction.add(LookupActions.INSPECT_CONTAINER);
                             argRadius = null;
                             argWid = 0;
                             lo = new Location(containerWorld, x, y, z);
@@ -336,16 +335,17 @@ public class RollbackRestoreCommand {
                         class BasicThread2 implements Runnable {
                             @Override
                             public void run() {
-                                if (!LookupThrottle.tryAcquire(player.getName(), 100)) {
+                                LookupThrottle.Claim claim = LookupThrottle.acquire(player.getName(), 100);
+                                if (claim == null) {
                                     Consumer.releaseRollback(player.getName());
                                     Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
                                     return;
                                 }
-                                try (Connection connection = Database.getConnection(false, 1000)) {
+                                try (Connection connection = Database.getConnection(false, 1000);
+                                        Statement statement = connection == null ? null : connection.createStatement()) {
                                     int action = finalAction;
                                     Location location = locationFinal;
                                     if (connection != null) {
-                                        Statement statement = connection.createStatement();
                                         String baduser = "";
                                         boolean exists = false;
                                         for (String check : rollbackusers2) {
@@ -385,7 +385,13 @@ public class RollbackRestoreCommand {
                                             }
                                             if (finalArgWid > 0) {
                                                 restrictWorld = true;
-                                                location = new Location(Bukkit.getServer().getWorld(WorldUtils.getWorldName(finalArgWid)), 0, 0, 0);
+                                                String worldName = WorldUtils.getWorldName(finalArgWid);
+                                                World world = Bukkit.getServer().getWorld(worldName);
+                                                if (world == null) {
+                                                    Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.WORLD_NOT_FOUND, worldName));
+                                                    return;
+                                                }
+                                                location = new Location(world, 0, 0, 0);
                                             }
                                             boolean verbose = false;
                                             if (noisy == 1) {
@@ -406,25 +412,28 @@ public class RollbackRestoreCommand {
                                                 String worldLabel = (location != null && location.getWorld() != null) ? location.getWorld().getName() : WorldUtils.getWorldName(finalArgWid);
                                                 users = "#" + worldLabel;
                                             }
-                                            if (finalPreview == 2) {
-                                                Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.PREVIEW_CANCELLING));
-                                            }
-                                            else if (finalPreview == 1) {
-                                                Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.ROLLBACK_STARTED, users, Selector.THIRD));
-                                            }
-                                            else if (action == 0) {
-                                                Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.ROLLBACK_STARTED, users, Selector.FIRST));
+                                            String userLabel = users;
+                                            BooleanSupplier admission = null;
+                                            if (savedRollback != null) {
+                                                admission = () -> {
+                                                    if (!consumeSavedRollback(player2.getName(), savedRollback)) {
+                                                        Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.ROLLBACK_ABORTED));
+                                                        return false;
+                                                    }
+                                                    sendStarted(player2, userLabel, finalPreview, action);
+                                                    return true;
+                                                };
                                             }
                                             else {
-                                                Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.ROLLBACK_STARTED, users, Selector.SECOND));
+                                                sendStarted(player2, userLabel, finalPreview, action);
                                             }
 
                                             boolean completed = true;
-                                            if (finalArgAction.contains(5) && ConfigHandler.lookupEntityContainer.get(player2.getName()) == null) {
-                                                completed = ContainerRollback.performContainerRollbackRestore(statement, player2, uuidList, rollbackusers2, rtime, blist, elist, euserlist, finalArgAction, location, radius, finalTimeStart, finalTimeEnd, restrictWorld, false, verbose, action);
+                                            if (finalArgAction.contains(LookupActions.INSPECT_CONTAINER) && ConfigHandler.lookupEntityContainer.get(player2.getName()) == null) {
+                                                completed = ContainerRollback.performContainerRollbackRestore(statement, player2, uuidList, rollbackusers2, rtime, blist, elist, euserlist, finalArgAction, location, radius, finalTimeStart, finalTimeEnd, restrictWorld, false, verbose, action, admission);
                                             }
                                             else {
-                                                completed = Rollback.performRollbackRestore(statement, player2, uuidList, rollbackusers2, rtime, blist, elist, euserlist, finalArgAction, finalEntityActionFilter, location, radius, finalTimeStart, finalTimeEnd, restrictWorld, false, verbose, action, finalPreview) != null;
+                                                completed = Rollback.performRollbackRestore(statement, player2, uuidList, rollbackusers2, rtime, blist, elist, euserlist, finalArgAction, finalEntityActionFilter, location, radius, finalTimeStart, finalTimeEnd, restrictWorld, false, verbose, action, finalPreview, admission) != null;
                                             }
                                             if (completed && finalPreview < 2) {
                                                 List<Object> list = new ArrayList<>();
@@ -438,7 +447,6 @@ public class RollbackRestoreCommand {
                                         else {
                                             Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.USER_NOT_FOUND, baduser));
                                         }
-                                        statement.close();
                                     }
                                     else {
                                         Chat.sendMessage(player2, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
@@ -449,16 +457,14 @@ public class RollbackRestoreCommand {
                                 }
                                 finally {
                                     Consumer.releaseRollback(player2.getName());
-                                    LookupThrottle.release(player2.getName());
+                                    claim.close();
                                 }
                             }
                         }
-                        Runnable runnable = new BasicThread2();
-                        Thread thread = new Thread(runnable);
                         try {
-                            thread.start();
+                            new Thread(new BasicThread2()).start();
                         }
-                        catch (Exception e) {
+                        catch (RuntimeException | Error e) {
                             Consumer.releaseRollback(player.getName());
                             throw e;
                         }
@@ -487,6 +493,28 @@ public class RollbackRestoreCommand {
         }
         else {
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
+        }
+    }
+
+    private static void sendStarted(CommandSender sender, String users, int preview, int action) {
+        String prefix = Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- ";
+        if (preview == 2) {
+            Chat.sendMessage(sender, prefix + Phrase.build(Phrase.PREVIEW_CANCELLING));
+        }
+        else {
+            String selector = preview == 1 ? Selector.THIRD : action == 0 ? Selector.FIRST : Selector.SECOND;
+            Chat.sendMessage(sender, prefix + Phrase.build(Phrase.ROLLBACK_STARTED, users, selector));
+        }
+    }
+
+    private static boolean consumeSavedRollback(String playerName, List<Object> savedRollback) {
+        Map<String, List<Object>> history = ConfigHandler.lastRollback;
+        synchronized (history) {
+            if (history.get(playerName) != savedRollback) {
+                return false;
+            }
+            history.remove(playerName);
+            return true;
         }
     }
 

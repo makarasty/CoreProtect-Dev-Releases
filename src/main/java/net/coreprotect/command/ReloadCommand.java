@@ -23,7 +23,7 @@ public class ReloadCommand {
 
     protected static void runCommand(final CommandSender player, boolean permission, String[] args) {
         if (permission) {
-            if (ConfigHandler.converterRunning) {
+            if (ConfigHandler.converterRunning || ConfigHandler.migrationRunning) {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.UPGRADE_IN_PROGRESS));
                 return;
             }
@@ -31,14 +31,14 @@ public class ReloadCommand {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.PURGE_IN_PROGRESS));
                 return;
             }
-            if (!LookupThrottle.tryAcquire(player.getName(), 100)) {
+            LookupThrottle.Claim claim = LookupThrottle.acquire(player.getName(), 100);
+            if (claim == null) {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
                 return;
             }
 
-            class BasicThread implements Runnable {
-                @Override
-                public void run() {
+            try {
+                new Thread(() -> {
                     try {
                         performReload(player);
                     }
@@ -46,17 +46,12 @@ public class ReloadCommand {
                         ErrorReporter.report(e);
                     }
                     finally {
-                        LookupThrottle.release(player.getName());
+                        claim.close();
                     }
-                }
-            }
-            try {
-                Runnable runnable = new BasicThread();
-                Thread thread = new Thread(runnable);
-                thread.start();
+                }).start();
             }
             catch (RuntimeException | Error e) {
-                LookupThrottle.release(player.getName());
+                claim.close();
                 throw e;
             }
         }
@@ -66,6 +61,10 @@ public class ReloadCommand {
     }
 
     static synchronized boolean performReload(CommandSender player) throws InterruptedException {
+        if (ConfigHandler.converterRunning || ConfigHandler.migrationRunning) {
+            Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.UPGRADE_IN_PROGRESS));
+            return false;
+        }
         final boolean resumePersistenceAfterCancellation = !Consumer.isDatabaseReloadPaused();
         boolean resumePersistence = resumePersistenceAfterCancellation;
         Consumer.OperationStartResult startResult = Consumer.beginDatabaseReload();

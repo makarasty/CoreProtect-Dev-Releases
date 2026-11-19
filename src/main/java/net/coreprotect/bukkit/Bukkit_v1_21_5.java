@@ -1,17 +1,27 @@
 package net.coreprotect.bukkit;
 
 import java.util.List;
+import java.util.Set;
 
+import org.bukkit.Material;
 import org.bukkit.entity.Chicken;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Pig;
 
+import net.coreprotect.model.BlockGroup;
+
 /**
  * Bukkit adapter implementation for Minecraft 1.21.5.
  */
 public class Bukkit_v1_21_5 extends Bukkit_v1_21 {
+
+    public Bukkit_v1_21_5() {
+        Set<Material> groundPlants = Set.of(Material.BUSH, Material.FIREFLY_BUSH, Material.SHORT_DRY_GRASS, Material.TALL_DRY_GRASS, Material.LEAF_LITTER);
+        BlockGroup.TRACK_TOP.addAll(groundPlants);
+        BlockGroup.NON_ATTACHABLE.addAll(groundPlants);
+    }
 
     @Override
     public boolean getEntityMeta(LivingEntity entity, List<Object> info) {
@@ -35,7 +45,7 @@ public class Bukkit_v1_21_5 extends Bukkit_v1_21 {
     @Override
     public boolean setEntityMeta(Entity entity, Object value, int count) {
         if (entity instanceof Chicken && count == 0) {
-            Chicken.Variant variant = getChickenVariant(value);
+            Chicken.Variant variant = resolveRegistryValue(this, value, Chicken.Variant.class);
             if (variant == null) {
                 return false;
             }
@@ -47,7 +57,7 @@ public class Bukkit_v1_21_5 extends Bukkit_v1_21 {
             return BukkitAdapter.setRegistryVariant(this, entity, value, "getVariant", "setVariant");
         }
         else if (entity instanceof Pig && count == 1) {
-            Pig.Variant variant = getPigVariant(value);
+            Pig.Variant variant = resolveRegistryValue(this, value, Pig.Variant.class);
             if (variant == null) {
                 return false;
             }
@@ -57,16 +67,6 @@ public class Bukkit_v1_21_5 extends Bukkit_v1_21 {
         }
 
         return super.setEntityMeta(entity, value, count);
-    }
-
-    private Chicken.Variant getChickenVariant(Object value) {
-        Object variant = value instanceof String ? getRegistryValue((String) value, Chicken.Variant.class) : value;
-        return variant instanceof Chicken.Variant ? (Chicken.Variant) variant : null;
-    }
-
-    private Pig.Variant getPigVariant(Object value) {
-        Object variant = value instanceof String ? getRegistryValue((String) value, Pig.Variant.class) : value;
-        return variant instanceof Pig.Variant ? (Pig.Variant) variant : null;
     }
 
 }

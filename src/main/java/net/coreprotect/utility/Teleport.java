@@ -32,7 +32,6 @@ public class Teleport {
 
     public static ConcurrentHashMap<Location, BlockData> revertBlocks = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Location, Long> REVERT_TOKENS = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<Location, Material> SAFETY_MATERIALS = new ConcurrentHashMap<>();
     private static final AtomicLong REVERT_SEQUENCE = new AtomicLong(0L);
     private static final Set<Material> UNSAFE_BLOCKS = createUnsafeBlocks();
 
@@ -74,11 +73,11 @@ public class Teleport {
         return gameMode != GameMode.CREATIVE && gameMode != GameMode.SPECTATOR && !player.isFlying();
     }
 
-    private static Material defaultSafetyMaterial() {
-        return ConfigHandler.isFolia ? Material.DIRT : Material.BARRIER;
+    public static void performSafeTeleport(Player player, Location location, boolean enforceTeleport) {
+        performSafeTeleport(player, location, enforceTeleport, ConfigHandler.isFolia);
     }
 
-    public static void performSafeTeleport(Player player, Location location, boolean enforceTeleport) {
+    static void performSafeTeleport(Player player, Location location, boolean enforceTeleport, boolean folia) {
         try {
             if (player == null || location == null || location.getWorld() == null) {
                 return;
@@ -87,46 +86,44 @@ public class Teleport {
             Location targetLocation = location.clone();
             World world = targetLocation.getWorld();
             int minHeight = BukkitAdapter.ADAPTER != null ? BukkitAdapter.ADAPTER.getMinHeight(world) : 0;
-            int worldHeight = world.getMaxHeight();
+            int maxFeetY = world.getMaxHeight() - 2;
             int playerX = targetLocation.getBlockX();
             int playerY = targetLocation.getBlockY();
             int playerZ = targetLocation.getBlockZ();
-            int checkY = Math.max(minHeight, Math.min(playerY - 1, worldHeight));
+            if (!enforceTeleport && playerY > maxFeetY) {
+                return;
+            }
+
+            int targetY = Math.min(playerY, maxFeetY);
+            int checkY = targetY > minHeight ? targetY - 1 : minHeight;
             boolean safeBlock = false;
             boolean alert = false;
 
-            while (!safeBlock) {
-                int above = Math.min(checkY + 1, worldHeight);
-
+            while (!safeBlock && checkY <= maxFeetY) {
                 Block block1 = world.getBlockAt(playerX, checkY, playerZ);
-                Block block2 = world.getBlockAt(playerX, above, playerZ);
+                Block block2 = world.getBlockAt(playerX, checkY + 1, playerZ);
                 Material type1 = block1.getType();
                 Material type2 = block2.getType();
 
                 if (BlockUtils.passableBlock(block1) && BlockUtils.passableBlock(block2) && !isUnsafeBlock(type1) && !isUnsafeBlock(type2)) {
-                    int below = checkY - 1;
-                    Block blockBelow = below >= minHeight ? world.getBlockAt(playerX, below, playerZ) : null;
+                    Block blockBelow = checkY > minHeight ? world.getBlockAt(playerX, checkY - 1, playerZ) : null;
+                    boolean needsSupport = enforceTeleport || (folia && checkY >= playerY);
                     boolean belowHazardous = blockBelow == null
                             || isUnsafeBlock(blockBelow.getType())
-                            || (enforceTeleport && BlockUtils.passableBlock(blockBelow) && !isSafeLiquid(blockBelow.getType()));
+                            || (needsSupport && BlockUtils.passableBlock(blockBelow) && !isSafeLiquid(blockBelow.getType()));
 
                     if (belowHazardous && isVulnerablePlayer(player)) {
-                        if (checkY < worldHeight) {
-                            boolean headClear = checkY + 2 >= worldHeight;
-                            if (!headClear) {
-                                Block blockAboveHead = world.getBlockAt(playerX, checkY + 2, playerZ);
-                                headClear = BlockUtils.passableBlock(blockAboveHead) && !isUnsafeBlock(blockAboveHead.getType());
-                            }
-                            if (headClear) {
-                                Material safetyMaterial = defaultSafetyMaterial();
+                        // Folia stops region ticks before plugins can restore temporary blocks.
+                        if (!folia && checkY < maxFeetY) {
+                            Block blockAboveHead = world.getBlockAt(playerX, checkY + 2, playerZ);
+                            if (BlockUtils.passableBlock(blockAboveHead) && !isUnsafeBlock(blockAboveHead.getType())) {
                                 Location revertLocation = block1.getLocation();
                                 BlockData originalBlockData = block1.getBlockData().clone();
-                                revertBlocks.computeIfAbsent(revertLocation, key -> originalBlockData);
                                 long token = REVERT_SEQUENCE.incrementAndGet();
                                 REVERT_TOKENS.put(revertLocation, token);
-                                SAFETY_MATERIALS.put(revertLocation, safetyMaterial);
-                                if (block1.getType() != safetyMaterial) {
-                                    block1.setType(safetyMaterial);
+                                if (type1 != Material.BARRIER) {
+                                    revertBlocks.put(revertLocation, originalBlockData);
+                                    block1.setType(Material.BARRIER);
                                 }
                                 alert = true;
                                 checkY++;
@@ -141,23 +138,16 @@ public class Teleport {
                     }
                 }
 
-                if (!safeBlock && (checkY >= worldHeight || player.getGameMode() == GameMode.SPECTATOR)) {
+                if (!safeBlock && player.getGameMode() == GameMode.SPECTATOR) {
+                    checkY = Math.min(checkY + 1, maxFeetY);
                     safeBlock = true;
-
-                    if (checkY < worldHeight) {
-                        checkY++;
-                    }
                 }
 
                 if (safeBlock && (checkY > playerY || enforceTeleport || alert)) {
-                    if (checkY > worldHeight) {
-                        checkY = worldHeight;
-                    }
-
                     if (checkY != playerY || enforceTeleport) {
                         double oldY = targetLocation.getY();
                         targetLocation.setY(checkY);
-                        if (ConfigHandler.isFolia) {
+                        if (folia) {
                             PaperAdapter.ADAPTER.teleportAsync(player, targetLocation);
                         }
                         else {
@@ -181,6 +171,9 @@ public class Teleport {
 
                 checkY++;
             }
+            if (!safeBlock && enforceTeleport) {
+                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.TELEPORT_UNSAFE));
+            }
         }
         catch (Exception e) {
             ErrorReporter.report(e);
@@ -199,52 +192,24 @@ public class Teleport {
             return;
         }
         BlockData revertData = revertBlocks.remove(revertLocation);
-        Material safetyMaterial = SAFETY_MATERIALS.remove(revertLocation);
         if (revertData == null) {
             return;
         }
-        Material expectedSafety = safetyMaterial != null ? safetyMaterial : defaultSafetyMaterial();
         Block block = revertLocation.getBlock();
-        if (block.getType() == expectedSafety) {
+        if (block.getType() == Material.BARRIER) {
             block.setBlockData(revertData);
         }
     }
 
     public static void revertAllBlocks() {
         for (Location revertLocation : new ArrayList<>(revertBlocks.keySet())) {
-            if (revertLocation == null || revertLocation.getWorld() == null) {
-                revertBlocks.remove(revertLocation);
-                REVERT_TOKENS.remove(revertLocation);
-                SAFETY_MATERIALS.remove(revertLocation);
-                continue;
-            }
-            if (PaperAdapter.ADAPTER != null && !PaperAdapter.ADAPTER.isOwnedByCurrentRegion(
-                    revertLocation.getWorld(), revertLocation.getBlockX() >> 4, revertLocation.getBlockZ() >> 4)) {
-                Long token = REVERT_TOKENS.get(revertLocation);
-                CoreProtect plugin = CoreProtect.getInstance();
-                if (token != null && plugin != null && plugin.isEnabled()) {
-                    try {
-                        Scheduler.runTask(plugin, () -> revertBlockIfUnchanged(revertLocation, token), revertLocation);
-                        continue;
-                    }
-                    catch (Exception e) {
-                        // Fall through to clean maps if scheduler is unavailable during shutdown
-                    }
-                }
-                revertBlocks.remove(revertLocation);
-                REVERT_TOKENS.remove(revertLocation);
-                SAFETY_MATERIALS.remove(revertLocation);
-                continue;
-            }
             BlockData revertData = revertBlocks.remove(revertLocation);
             REVERT_TOKENS.remove(revertLocation);
-            Material safetyMaterial = SAFETY_MATERIALS.remove(revertLocation);
-            if (revertData == null) {
+            if (revertData == null || revertLocation.getWorld() == null) {
                 continue;
             }
-            Material expectedSafety = safetyMaterial != null ? safetyMaterial : defaultSafetyMaterial();
             Block block = revertLocation.getBlock();
-            if (block.getType() == expectedSafety) {
+            if (block.getType() == Material.BARRIER) {
                 block.setBlockData(revertData);
             }
         }

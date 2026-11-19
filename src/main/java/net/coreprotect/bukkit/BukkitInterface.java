@@ -14,6 +14,7 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.Sign;
+import org.bukkit.block.Skull;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Arrow;
 import org.bukkit.entity.Entity;
@@ -67,6 +68,8 @@ public interface BukkitInterface {
      */
     int getMinHeight(World world);
 
+    boolean isUltraWarm(World world);
+
     /**
      * Gets the legacy block ID for a material.
      * 
@@ -111,6 +114,20 @@ public interface BukkitInterface {
      * @return The block data, or null if unsupported/unavailable
      */
     BlockData createBlockDataFromString(String blockData);
+
+    default String getSkullProfileOwner(Skull skull) {
+        return null;
+    }
+
+    default void setSkullProfileOwner(Skull skull, String name) {
+    }
+
+    default String getSkullSkin(Skull skull) {
+        return null;
+    }
+
+    default void setSkullSkin(Skull skull, String skin) {
+    }
 
     // --------------------------------------------------------------------------
     // Material type checking methods
@@ -211,6 +228,8 @@ public interface BukkitInterface {
      * @return The seeds material
      */
     Material getPlantSeeds(Material material);
+
+    boolean isSingleBlockPitcherCrop(BlockData blockData);
 
     // --------------------------------------------------------------------------
     // Item and inventory methods
@@ -404,6 +423,8 @@ public interface BukkitInterface {
     // --------------------------------------------------------------------------
     // Sign methods
     // --------------------------------------------------------------------------
+
+    void sendSignUpdate(Player player, Location location, Sign sign);
 
     /**
      * Checks if a sign is glowing.

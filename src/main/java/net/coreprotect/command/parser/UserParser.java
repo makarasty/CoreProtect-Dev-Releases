@@ -36,9 +36,13 @@ public class UserParser {
         for (int index = 1; index < inputArguments.length; index++) {
             String argument = ParserUtils.normalize(inputArguments[index]);
 
-            if (next == 2) {
+            boolean startsParameter = MessageFilterParser.isLookupTerminator(argument);
+            if (next == 2 && !startsParameter) {
                 next = argument.endsWith(",") ? 2 : 0;
                 continue;
+            }
+            if (startsParameter && (next != 1 || argument.indexOf(':') >= 0)) {
+                next = 0;
             }
             if (ParserUtils.equalsAny(argument, USER_PREFIXES)) {
                 next = 1;
@@ -95,6 +99,10 @@ public class UserParser {
             }
 
             String stripped = ParserUtils.stripPrefix(argument, EXCLUDE_PREFIXES);
+            if (stripped == null && next == 5 && argument.indexOf(':') >= 0 && MessageFilterParser.isLookupTerminator(argument)) {
+                next = 0;
+                continue;
+            }
             if (next == 5 || stripped != null) {
                 String excludeSpec = (stripped != null) ? stripped : argument;
                 if (excludeSpec.contains(",")) {
@@ -117,7 +125,7 @@ public class UserParser {
 
     private static void addExcludedUserIfNotMaterial(List<String> excluded, String token) {
         String candidate = token.trim();
-        if (!candidate.isEmpty() && !MaterialParser.isBlockOrEntity(candidate)) {
+        if (!candidate.isEmpty() && candidate.indexOf(':') < 0 && !MaterialParser.isBlockOrEntity(candidate)) {
             excluded.add(candidate);
         }
     }

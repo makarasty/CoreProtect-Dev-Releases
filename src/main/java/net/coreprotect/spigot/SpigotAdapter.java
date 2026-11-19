@@ -3,6 +3,7 @@ package net.coreprotect.spigot;
 import java.util.List;
 import java.util.regex.Matcher;
 
+import org.bukkit.ChatColor;
 import org.bukkit.DyeColor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
@@ -11,6 +12,7 @@ import org.bukkit.entity.Villager;
 import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.utility.Chat;
+import net.coreprotect.utility.Color;
 import net.coreprotect.utility.Util;
 
 public class SpigotAdapter implements SpigotInterface {
@@ -27,12 +29,15 @@ public class SpigotAdapter implements SpigotInterface {
     public static final int SPIGOT_V1_20 = BukkitAdapter.BUKKIT_V1_20;
     public static final int SPIGOT_V1_21 = BukkitAdapter.BUKKIT_V1_21;
     public static final int SPIGOT_V1_21_5 = BukkitAdapter.BUKKIT_V1_21_5;
+    public static final int SPIGOT_V1_21_11 = BukkitAdapter.BUKKIT_V1_21_11;
     public static final int SPIGOT_V26_0 = BukkitAdapter.BUKKIT_V26_0;
     public static final int SPIGOT_V26_1 = BukkitAdapter.BUKKIT_V26_1;
     public static final int SPIGOT_V26_2 = BukkitAdapter.BUKKIT_V26_2;
+    public static final int SPIGOT_V26_3 = BukkitAdapter.BUKKIT_V26_3;
 
     public static void loadAdapter() {
         if (!ConfigHandler.isSpigot || ConfigHandler.SERVER_VERSION == SPIGOT_UNAVAILABLE) {
+            Color.DARK_AQUA = ChatColor.DARK_AQUA.toString();
             SpigotAdapter.ADAPTER = new SpigotAdapter();
             return;
         }

@@ -103,10 +103,34 @@ public class TimeParser {
         }
     }
 
-    private static final class ParsedTime {
+    public static final class ParsedTime {
         private final DurationSide first = new DurationSide();
         private final DurationSide second = new DurationSide();
         private boolean range;
+        private String invalidArgument;
+
+        public long[] sortedSeconds() {
+            long firstSeconds = first.toSeconds();
+            long secondSeconds = range ? second.toSeconds() : 0L;
+            return new long[] { Math.max(firstSeconds, secondSeconds), Math.min(firstSeconds, secondSeconds) };
+        }
+
+        public String invalidArgument() {
+            return invalidArgument;
+        }
+
+        public String description() {
+            if (first.isEmpty()) {
+                return "";
+            }
+            StringBuilder builder = new StringBuilder();
+            first.appendFormatted(builder, range);
+            if (range && !second.isEmpty()) {
+                builder.append(" -");
+                second.appendFormatted(builder, true);
+            }
+            return builder.toString();
+        }
     }
 
     /**
@@ -117,14 +141,21 @@ public class TimeParser {
      * @return An array of two longs - [time1, time2]
      */
     public static long[] parseTime(String[] inputArguments) {
-        ParsedTime parsed = parseDurationArguments(inputArguments);
-        long timeStart = parsed.first.toSeconds();
-        long timeEnd = parsed.range ? parsed.second.toSeconds() : 0L;
+        return parseDurationArguments(inputArguments).sortedSeconds();
+    }
 
-        if (timeEnd >= timeStart) {
-            return new long[] { timeEnd, timeStart };
+    public static long[] parsePurgeTime(String[] inputArguments) {
+        ParsedTime parsed = parseDurationArguments(inputArguments);
+        long[] bounds = parsed.sortedSeconds();
+        if (!parsed.range) {
+            bounds[1] = bounds[0];
+            bounds[0] = 0L;
         }
-        return new long[] { timeStart, timeEnd };
+        return bounds;
+    }
+
+    public static boolean isValidDuration(String spec) {
+        return parseDurationSpec(spec, new ParsedTime());
     }
 
     /**
@@ -135,71 +166,57 @@ public class TimeParser {
      * @return A formatted time string
      */
     public static String parseTimeString(String[] inputArguments) {
-        ParsedTime parsed = parseDurationArguments(inputArguments);
-        if (parsed.first.isEmpty()) {
-            return "";
-        }
-
-        StringBuilder builder = new StringBuilder();
-        parsed.first.appendFormatted(builder, parsed.range);
-        if (parsed.range && !parsed.second.isEmpty()) {
-            builder.append(" -");
-            parsed.second.appendFormatted(builder, true);
-        }
-        return builder.toString();
+        return parseDurationArguments(inputArguments).description();
     }
 
-    private static ParsedTime parseDurationArguments(String[] inputArguments) {
+    public static ParsedTime parseDurationArguments(String[] inputArguments) {
         ParsedTime parsed = new ParsedTime();
-        int next = 0;
+        String pendingPrefix = null;
 
         for (int index = 1; index < inputArguments.length; index++) {
-            String argument = ParserUtils.normalize(inputArguments[index]);
-            if (ParserUtils.equalsAny(argument, TIME_PREFIXES)) {
-                next = 1;
-                continue;
-            }
-
+            String raw = inputArguments[index];
+            String argument = ParserUtils.normalize(raw);
             String stripped = ParserUtils.stripPrefix(argument, TIME_PREFIXES);
-            if (next == 1 || stripped != null) {
-                String spec = (stripped != null) ? stripped : argument;
-                next = 0;
-
-                if (spec.isEmpty() || spec.startsWith("-") || spec.endsWith("-")) {
-                    continue;
+            if (pendingPrefix != null) {
+                if (stripped != null || !parseDurationSpec(argument, parsed)) {
+                    parsed.invalidArgument = pendingPrefix;
+                    return parsed;
                 }
-
-                int dashIndex = spec.indexOf('-');
-                if (dashIndex >= 0) {
-                    if (spec.indexOf('-', dashIndex + 1) >= 0) {
-                        continue;
-                    }
-                    List<UnitEntry> startEntries = parseSide(spec.substring(0, dashIndex));
-                    List<UnitEntry> endEntries = parseSide(spec.substring(dashIndex + 1));
-                    if (startEntries != null && endEntries != null) {
-                        parsed.first.merge(startEntries);
-                        parsed.second.merge(endEntries);
-                        parsed.range = true;
-                    }
-                }
-                else {
-                    List<UnitEntry> entries = parseSide(spec);
-                    if (entries != null) {
-                        if (parsed.range) {
-                            parsed.second.merge(entries);
-                        }
-                        else {
-                            parsed.first.merge(entries);
-                        }
-                    }
-                }
+                pendingPrefix = null;
             }
-            else {
-                next = 0;
+            else if ("".equals(stripped)) {
+                pendingPrefix = raw;
+            }
+            else if (stripped != null && !parseDurationSpec(stripped, parsed)) {
+                parsed.invalidArgument = raw;
+                return parsed;
             }
         }
 
+        parsed.invalidArgument = pendingPrefix;
         return parsed;
+    }
+
+    private static boolean parseDurationSpec(String spec, ParsedTime parsed) {
+        int dashIndex = spec.indexOf('-');
+        if (dashIndex < 0) {
+            List<UnitEntry> entries = parseSide(spec);
+            if (entries == null) {
+                return false;
+            }
+            (parsed.range ? parsed.second : parsed.first).merge(entries);
+        }
+        else {
+            List<UnitEntry> startEntries = parseSide(spec.substring(0, dashIndex));
+            List<UnitEntry> endEntries = parseSide(spec.substring(dashIndex + 1));
+            if (startEntries == null || endEntries == null) {
+                return false;
+            }
+            parsed.first.merge(startEntries);
+            parsed.second.merge(endEntries);
+            parsed.range = true;
+        }
+        return true;
     }
 
     private static List<UnitEntry> parseSide(String spec) {

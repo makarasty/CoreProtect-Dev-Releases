@@ -4,6 +4,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Objects;
 
+import org.bukkit.DyeColor;
 import org.bukkit.block.Sign;
 
 import net.coreprotect.bukkit.BukkitAdapter;
@@ -51,8 +52,26 @@ public final class SignState {
         return lines[index] == null ? "" : lines[index];
     }
 
+    public boolean hasText() {
+        for (int index = 0; index < lines.length; index++) {
+            if (!getLine(index).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public SignState withDecoration(int frontColor, int backColor, boolean frontGlow, boolean backGlow, boolean isWaxed) {
+        return new SignState(lines, frontColor, backColor, frontGlow, backGlow, isWaxed);
+    }
+
     public int getColor(boolean front) {
         return front ? color : colorSecondary;
+    }
+
+    private int appliedColor(boolean front) {
+        int rgb = getColor(front);
+        return rgb == 0 ? DyeColor.BLACK.getColor().asRGB() : rgb;
     }
 
     public boolean isGlowing(boolean front) {
@@ -69,9 +88,7 @@ public final class SignState {
         }
         for (int face = 0; face < 2; face++) {
             boolean front = face == 0;
-            if (getColor(front) > 0) {
-                BukkitAdapter.ADAPTER.setColor(sign, front, getColor(front));
-            }
+            BukkitAdapter.ADAPTER.setColor(sign, front, appliedColor(front));
             BukkitAdapter.ADAPTER.setGlowing(sign, front, isGlowing(front));
         }
         BukkitAdapter.ADAPTER.setWaxed(sign, waxed);
@@ -84,7 +101,7 @@ public final class SignState {
                 return true;
             }
         }
-        return getColor(front) != other.getColor(front) || isGlowing(front) != other.isGlowing(front) || waxed != other.waxed;
+        return appliedColor(front) != other.appliedColor(front) || isGlowing(front) != other.isGlowing(front) || waxed != other.waxed;
     }
 
     public boolean matchesChanges(SignState source, SignState target, boolean front) {
@@ -94,7 +111,7 @@ public final class SignState {
                 return false;
             }
         }
-        return (source.getColor(front) == target.getColor(front) || getColor(front) == source.getColor(front))
+        return (source.appliedColor(front) == target.appliedColor(front) || appliedColor(front) == source.appliedColor(front))
                 && (source.isGlowing(front) == target.isGlowing(front) || isGlowing(front) == source.isGlowing(front))
                 && (source.waxed == target.waxed || waxed == source.waxed);
     }
@@ -106,8 +123,8 @@ public final class SignState {
                 BukkitAdapter.ADAPTER.setLine(sign, index, getLine(index));
             }
         }
-        if (source.getColor(front) != getColor(front) && getColor(front) > 0) {
-            BukkitAdapter.ADAPTER.setColor(sign, front, getColor(front));
+        if (source.appliedColor(front) != appliedColor(front)) {
+            BukkitAdapter.ADAPTER.setColor(sign, front, appliedColor(front));
         }
         if (source.isGlowing(front) != isGlowing(front)) {
             BukkitAdapter.ADAPTER.setGlowing(sign, front, isGlowing(front));

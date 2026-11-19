@@ -3,9 +3,7 @@ package net.coreprotect.bukkit;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -50,6 +48,7 @@ import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionType;
 
 import net.coreprotect.config.ConfigHandler;
+import net.coreprotect.utility.AdapterMethods;
 import net.coreprotect.utility.BlockUtils;
 
 /**
@@ -74,10 +73,10 @@ public class BukkitAdapter implements BukkitInterface {
     public static final int BUKKIT_V1_21 = 21;
     public static final int BUKKIT_V1_21_5 = 21005;
     public static final int BUKKIT_V1_21_11 = 21011;
-    public static final int BUKKIT_V26_0 = 26000;
-    public static final int BUKKIT_V26_1 = 26010;
-    public static final int BUKKIT_V26_2 = 26020;
-    public static final int BUKKIT_V26_3 = 26030;
+    public static final int BUKKIT_V26_0 = 260000;
+    public static final int BUKKIT_V26_1 = 260100;
+    public static final int BUKKIT_V26_2 = 260200;
+    public static final int BUKKIT_V26_3 = 260300;
 
     public static int getAdapterVersion(int major, int minor) {
         return getAdapterVersion(major, minor, 0);
@@ -88,7 +87,7 @@ public class BukkitAdapter implements BukkitInterface {
             return minor == 21 && patch >= 5 ? (minor * 1000) + patch : minor;
         }
 
-        return (major * 1000) + (minor * 10) + patch;
+        return (major * 10000) + (minor * 100) + patch;
     }
 
     /**
@@ -130,7 +129,7 @@ public class BukkitAdapter implements BukkitInterface {
     }
 
     // -------------------- Basic data conversion methods --------------------
-    public static Set<Material> EMPTY_SET = new HashSet<>(Arrays.asList());
+    public static final Set<Material> EMPTY_SET = Collections.emptySet();
 
     @Override
     public String parseLegacyName(String name) {
@@ -179,7 +178,7 @@ public class BukkitAdapter implements BukkitInterface {
      */
     public static boolean getRegistryVariant(BukkitInterface adapter, Entity entity, List<Object> info, String getterName) {
         try {
-            Object variant = entity.getClass().getMethod(getterName).invoke(entity);
+            Object variant = AdapterMethods.invokeNoArguments(entity, getterName);
             if (variant == null) {
                 return false;
             }
@@ -198,13 +197,21 @@ public class BukkitAdapter implements BukkitInterface {
      */
     public static boolean setRegistryVariant(BukkitInterface adapter, Entity entity, Object value, String getterName, String setterName) {
         try {
-            Class<?> variantClass = entity.getClass().getMethod(getterName).getReturnType();
-            Object variant = value instanceof String ? adapter.getRegistryValue((String) value, variantClass) : value;
-            if (!variantClass.isInstance(variant)) {
+            Method getter = AdapterMethods.find(entity.getClass(), getterName);
+            if (getter == null) {
+                return false;
+            }
+            Class<?> variantClass = getter.getReturnType();
+            Object variant = resolveRegistryValue(adapter, value, variantClass);
+            if (variant == null) {
                 return false;
             }
 
-            entity.getClass().getMethod(setterName, variantClass).invoke(entity, variant);
+            Method setter = AdapterMethods.find(entity.getClass(), setterName, variantClass);
+            if (setter == null) {
+                return false;
+            }
+            setter.invoke(entity, variant);
             return true;
         }
         catch (ReflectiveOperationException | LinkageError e) {
@@ -213,7 +220,7 @@ public class BukkitAdapter implements BukkitInterface {
     }
 
     public static Object getLegacyEnumValue(Class<?> type, String name) {
-        if (!type.isEnum()) {
+        if (name == null || !type.isEnum()) {
             return null;
         }
         try {
@@ -222,6 +229,16 @@ public class BukkitAdapter implements BukkitInterface {
             return value;
         }
         catch (IllegalArgumentException | LinkageError exception) {
+            return null;
+        }
+    }
+
+    public static <T> T resolveRegistryValue(BukkitInterface adapter, Object value, Class<T> type) {
+        try {
+            Object resolved = adapter != null && value instanceof String ? adapter.getRegistryValue((String) value, type) : value;
+            return type.isInstance(resolved) ? type.cast(resolved) : null;
+        }
+        catch (IllegalArgumentException e) {
             return null;
         }
     }
@@ -237,11 +254,16 @@ public class BukkitAdapter implements BukkitInterface {
     @Override
     public void refreshVillagerBrain(Villager villager) {
         try {
-            Object handle = villager.getClass().getMethod("getHandle").invoke(villager);
-            Object level = villager.getWorld().getClass().getMethod("getHandle").invoke(villager.getWorld());
-            invokeSingleArgumentMethod(handle, "refreshBrain", level);
+            Object handle = AdapterMethods.invokeNoArguments(villager, "getHandle");
+            Object level = AdapterMethods.invokeNoArguments(villager.getWorld(), "getHandle");
+            if (handle != null && level != null) {
+                Method refresh = AdapterMethods.findAssignableSingleArgument(handle.getClass(), "refreshBrain", level.getClass());
+                if (refresh != null) {
+                    refresh.invoke(handle, level);
+                }
+            }
         }
-        catch (Exception e) {
+        catch (ReflectiveOperationException | LinkageError e) {
         }
     }
 
@@ -315,6 +337,11 @@ public class BukkitAdapter implements BukkitInterface {
     }
 
     @Override
+    public boolean isSingleBlockPitcherCrop(BlockData blockData) {
+        return false;
+    }
+
+    @Override
     public ItemStack adjustIngredient(MerchantRecipe recipe, ItemStack itemStack) {
         return null;
     }
@@ -333,24 +360,6 @@ public class BukkitAdapter implements BukkitInterface {
         }
 
         return itemStack;
-    }
-
-    private static void invokeSingleArgumentMethod(Object target, String methodName, Object argument) {
-        if (target == null || argument == null) {
-            return;
-        }
-
-        for (Method method : target.getClass().getMethods()) {
-            Class<?>[] parameterTypes = method.getParameterTypes();
-            if (method.getName().equals(methodName) && parameterTypes.length == 1 && parameterTypes[0].isInstance(argument)) {
-                try {
-                    method.invoke(target, argument);
-                }
-                catch (Exception e) {
-                }
-                return;
-            }
-        }
     }
 
     // -------------------- Block methods --------------------
@@ -385,6 +394,11 @@ public class BukkitAdapter implements BukkitInterface {
     @Override
     public int getMinHeight(World world) {
         return 0;
+    }
+
+    @Override
+    public boolean isUltraWarm(World world) {
+        return world.getEnvironment() == World.Environment.NETHER;
     }
 
     @Override
@@ -437,8 +451,11 @@ public class BukkitAdapter implements BukkitInterface {
     @Override
     public <T extends Entity> T spawn(World world, Location location, Class<T> entityClass, Consumer<? super T> function) {
         // Bukkit 1.20.1 and earlier only have World#spawn(Location, Class, org.bukkit.util.Consumer), which is deprecated for removal in the current API
+        Class<?> consumerClass = LegacySpawn.CONSUMER_CLASS;
+        if (LegacySpawn.METHOD == null) {
+            throw new IllegalStateException("Legacy Bukkit spawn method is unavailable");
+        }
         try {
-            Class<?> consumerClass = Class.forName("org.bukkit.util.Consumer");
             Object consumer = Proxy.newProxyInstance(consumerClass.getClassLoader(), new Class<?>[] { consumerClass }, (proxy, method, args) -> {
                 if (method.getDeclaringClass() == Object.class) {
                     switch (method.getName()) {
@@ -453,8 +470,7 @@ public class BukkitAdapter implements BukkitInterface {
                 function.accept(entityClass.cast(args[0]));
                 return null;
             });
-            Method spawnMethod = World.class.getMethod("spawn", Location.class, Class.class, consumerClass);
-            return entityClass.cast(spawnMethod.invoke(world, location, entityClass, consumer));
+            return entityClass.cast(LegacySpawn.METHOD.invoke(world, location, entityClass, consumer));
         }
         catch (InvocationTargetException e) {
             Throwable cause = e.getCause();
@@ -469,6 +485,11 @@ public class BukkitAdapter implements BukkitInterface {
         catch (ReflectiveOperationException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    private static final class LegacySpawn {
+        private static final Class<?> CONSUMER_CLASS = AdapterMethods.findType("org.bukkit.util.Consumer");
+        private static final Method METHOD = CONSUMER_CLASS == null ? null : AdapterMethods.find(World.class, "spawn", Location.class, Class.class, CONSUMER_CLASS);
     }
 
     @Override
@@ -504,8 +525,13 @@ public class BukkitAdapter implements BukkitInterface {
     // -------------------- Sign handling methods --------------------
 
     @Override
+    public void sendSignUpdate(Player player, Location location, Sign sign) {
+        player.sendSignChange(location, sign.getLines(), sign.getColor());
+    }
+
+    @Override
     public String getLine(Sign sign, int line) {
-        if (line < 4) {
+        if (line >= 0 && line < 4) {
             return sign.getLine(line);
         }
         else {
@@ -519,7 +545,7 @@ public class BukkitAdapter implements BukkitInterface {
             string = "";
         }
 
-        if (line < 4) {
+        if (line >= 0 && line < 4) {
             sign.setLine(line, string);
         }
     }
@@ -562,11 +588,14 @@ public class BukkitAdapter implements BukkitInterface {
 
     @Override
     public void setColor(Sign sign, boolean isFront, int color) {
-        if (!isFront) {
-            return;
+        DyeColor dye = isFront ? getSignDyeColor(color) : null;
+        if (dye != null) {
+            sign.setColor(dye);
         }
+    }
 
-        sign.setColor(DyeColor.getByColor(Color.fromRGB(color)));
+    protected static DyeColor getSignDyeColor(int color) {
+        return (color & ~0xFFFFFF) == 0 ? DyeColor.getByColor(Color.fromRGB(color)) : null;
     }
 
     @Override
@@ -576,11 +605,8 @@ public class BukkitAdapter implements BukkitInterface {
 
     @Override
     public int getColor(Sign sign, boolean isFront) {
-        if (isFront) {
-            return sign.getColor().getColor().asRGB();
-        }
-
-        return 0;
+        DyeColor dye = isFront ? sign.getColor() : null;
+        return dye == null ? 0 : dye.getColor().asRGB();
     }
 
     // -------------------- Registry methods --------------------
