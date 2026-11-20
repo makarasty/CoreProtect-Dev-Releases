@@ -25,7 +25,6 @@ import net.coreprotect.model.lookup.LookupPage;
 import net.coreprotect.model.lookup.LookupRollbackState;
 import net.coreprotect.model.lookup.LookupSummaryPage;
 import net.coreprotect.model.lookup.LookupSummaryRow;
-import net.coreprotect.utility.ErrorReporter;
 
 public class Lookup extends Queue {
 
@@ -70,7 +69,9 @@ public class Lookup extends Queue {
             paused = Consumer.claimLookupPause();
 
             try (ResultSet results = LookupRaw.rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, null, startTime, endTime, -1, -1, restrictWorld, lookup, true, entityContainerId, rollbackState, explicitWorldId)) {
-                requireQueryResult(results, failOnError);
+                if (!hasQueryResult(results, failOnError)) {
+                    return 0L;
+                }
                 while (results.next()) {
                     int resultTable = results.getInt("tbl");
                     long count = results.getLong("count");
@@ -119,8 +120,7 @@ public class Lookup extends Queue {
         try {
             paused = Consumer.claimLookupPause();
             try (ResultSet results = LookupRaw.rawSummaryResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, entityContext, location, radius, startTime, endTime, -1, -1, restrictWorld, entityContainerId, true, rollbackState, explicitWorldId)) {
-                requireQueryResult(results, failOnError);
-                return results.next() ? results.getLong("count") : 0L;
+                return hasQueryResult(results, failOnError) && results.next() ? results.getLong("count") : 0L;
             }
         }
         catch (Exception e) {
@@ -161,7 +161,9 @@ public class Lookup extends Queue {
         try {
             paused = Consumer.claimLookupPause();
             try (ResultSet results = LookupRaw.rawSummaryResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, entityContext, location, radius, startTime, endTime, limitOffset, limitCount, restrictWorld, entityContainerId, false, rollbackState, explicitWorldId)) {
-                requireQueryResult(results, failOnError);
+                if (!hasQueryResult(results, failOnError)) {
+                    return rows;
+                }
                 while (results.next()) {
                     rows.add(summaryRow(results));
                 }
@@ -206,7 +208,9 @@ public class Lookup extends Queue {
         try {
             paused = Consumer.claimLookupPause();
             try (ResultSet results = LookupRaw.rawSummaryPageResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, entityContext, location, radius, startTime, endTime, limitOffset, limitCount, restrictWorld, entityContainerId, rollbackState, explicitWorldId)) {
-                requireQueryResult(results, failOnError);
+                if (!hasQueryResult(results, failOnError)) {
+                    return new LookupSummaryPage(0L, rows);
+                }
                 while (results.next()) {
                     if (rows.isEmpty()) {
                         totalRows = results.getLong("total_count");
@@ -253,7 +257,7 @@ public class Lookup extends Queue {
     }
 
     private static boolean hasSummaryActions(List<Integer> actionList) {
-        if (actionList.contains(LookupActions.CONTAINER) || actionList.contains(5)) {
+        if (actionList.contains(LookupActions.CONTAINER) || actionList.contains(LookupActions.INSPECT_CONTAINER)) {
             return true;
         }
         if (actionList.contains(LookupActions.CHAT) || actionList.contains(LookupActions.COMMAND) || actionList.contains(LookupActions.SESSION) || actionList.contains(LookupActions.USERNAME) || actionList.contains(LookupActions.SIGN)) {
@@ -270,7 +274,7 @@ public class Lookup extends Queue {
             newList = LookupConverter.convertRawLookup(statement, lookupList);
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            Database.reportDatabaseFailure(e);
         }
 
         return newList;
@@ -314,8 +318,7 @@ public class Lookup extends Queue {
 
         try {
             List<Object[]> lookupList = LookupRaw.performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, entityContainerId, rollbackState, explicitWorldId);
-            requireQueryResult(lookupList, failOnError);
-            newList = LookupConverter.convertRawLookup(statement, lookupList);
+            newList = hasQueryResult(lookupList, failOnError) ? LookupConverter.convertRawLookup(statement, lookupList) : null;
         }
         catch (Exception e) {
             handleQueryFailure(e, failOnError);
@@ -355,10 +358,11 @@ public class Lookup extends Queue {
         return new LookupPage(page.getTotalRows(), rows, page.getNextCursor());
     }
 
-    static void requireQueryResult(Object result, boolean failOnError) {
+    static boolean hasQueryResult(Object result, boolean failOnError) {
         if (result == null && failOnError) {
             throw new QueryFailure(null);
         }
+        return result != null;
     }
 
     private static void handleQueryFailure(Exception failure, boolean failOnError) {
@@ -368,7 +372,7 @@ public class Lookup extends Queue {
         if (failOnError) {
             throw new QueryFailure(failure);
         }
-        ErrorReporter.report(failure);
+        Database.reportDatabaseFailure(failure);
     }
 
     public static final class QueryFailure extends RuntimeException {
@@ -416,8 +420,4 @@ public class Lookup extends Queue {
         return LookupRaw.performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, entityContainerId, LookupRollbackState.ANY);
     }
 
-    // Maintain backward compatibility
-    private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count) {
-        return LookupRaw.rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count);
-    }
 }

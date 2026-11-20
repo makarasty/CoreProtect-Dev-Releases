@@ -1,42 +1,95 @@
 package net.coreprotect.utility;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import org.bukkit.Material;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
+import org.bukkit.entity.ThrowableProjectile;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.projectiles.ProjectileSource;
 
 import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.ConfigHandler;
-import org.bukkit.entity.ThrowableProjectile;
 
 public class EntityUtils {
 
-    private static final String NAMESPACE = "minecraft:";
+    private static final String MINECRAFT_NAMESPACE = "minecraft:";
+    private static final Map<String, EntityType> ENTITY_TYPES = entityTypes();
 
     private EntityUtils() {
         throw new IllegalStateException("Utility class");
     }
 
     public static String getEntityUser(Entity entity) {
-        if (entity instanceof Projectile) {
-            ProjectileSource shooter = ((Projectile) entity).getShooter();
-            if (shooter instanceof Entity) {
-                entity = (Entity) shooter;
-            }
-        }
+        return getDirectEntityUser(getEntitySource(entity));
+    }
+
+    public static String getDirectEntityUser(Entity entity) {
         if (entity instanceof Player) {
             return entity.getName();
         }
+        return getEntityTypeUser(entity);
+    }
+
+    public static String getEntityTypeUser(Entity entity) {
         if (entity == null) {
             return null;
         }
 
         EntityType type = entity.getType();
         return type == null ? null : "#" + type.name().toLowerCase(Locale.ROOT);
+    }
+
+    public static String getLivingProjectileShooterUser(Projectile projectile) {
+        ProjectileSource shooter = projectile.getShooter();
+        return shooter instanceof LivingEntity ? getDirectEntityUser((LivingEntity) shooter) : null;
+    }
+
+    public static Entity getDamager(EntityDamageEvent damage) {
+        return damage instanceof EntityDamageByEntityEvent ? ((EntityDamageByEntityEvent) damage).getDamager() : null;
+    }
+
+    public static Entity getEntitySource(Entity entity) {
+        if (entity instanceof Projectile) {
+            ProjectileSource shooter = ((Projectile) entity).getShooter();
+            if (shooter instanceof Entity) {
+                return (Entity) shooter;
+            }
+        }
+        return entity;
+    }
+
+    public static String getBreakUser(Entity entity, String fallback) {
+        String user = getEntityUser(entity);
+        if (user == null) {
+            return fallback;
+        }
+        switch (user) {
+            case "#primed_tnt":
+            case "#tnt_minecart":
+            case "#minecart_tnt":
+                return "#tnt";
+            case "#ender_dragon":
+            case "#ender_dragon_part":
+                return "#enderdragon";
+            case "#wither_skull":
+                return "#wither";
+            case "#wind_charge":
+                return "#windcharge";
+            case "#breeze_wind_charge":
+                return "#breezewindcharge";
+            default:
+                return user;
+        }
     }
 
     public static int getEntityId(EntityType type) {
@@ -100,32 +153,83 @@ public class EntityUtils {
     }
 
     public static EntityType getEntityType(int id) {
-        // Internal ID pulled from DB
-        EntityType entitytype = EntityType.UNKNOWN;
-        String name = getEntityName(id);
-        if (!name.isEmpty()) {
-            if (name.contains(NAMESPACE)) {
-                name = name.split(":")[1];
-            }
-            entitytype = EntityType.valueOf(name.toUpperCase(Locale.ROOT));
+        return getEntityType(id, null);
+    }
+
+    public static EntityType getEntityType(int id, String boatVariant) {
+        String name = entityKey(getEntityName(id));
+        if (BukkitAdapter.ADAPTER != null && ("boat".equals(name) || "chest_boat".equals(name))) {
+            return BukkitAdapter.ADAPTER.resolveStoredBoatType("chest_boat".equals(name), boatVariant);
         }
-        return entitytype;
+        return ENTITY_TYPES.getOrDefault(name, EntityType.UNKNOWN);
     }
 
     public static EntityType getEntityType(String name) {
-        // Name entered by user
-        if (name == null) {
-            return null;
-        }
-        name = name.toLowerCase(Locale.ROOT).trim();
-        if (name.startsWith(NAMESPACE)) {
-            name = name.substring(NAMESPACE.length());
-        }
-        if (name.isEmpty() || name.indexOf(':') >= 0 || getEntityId(name, false) == -1) {
-            return null;
-        }
+        return ENTITY_TYPES.get(entityKey(name));
+    }
 
-        return EntityType.valueOf(name.toUpperCase(Locale.ROOT));
+    public static List<Integer> getEntityIds(EntityType type) {
+        if (type == null) {
+            return List.of();
+        }
+        List<Integer> ids = new ArrayList<>();
+        Map<String, Integer> entities = ConfigHandler.entities;
+        synchronized (entities) {
+            for (Map.Entry<String, Integer> entry : entities.entrySet()) {
+                if (getEntityType(entry.getKey()) == type) {
+                    ids.add(entry.getValue());
+                }
+            }
+        }
+        return ids;
+    }
+
+    private static String entityKey(String name) {
+        String key = name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+        return key.startsWith(MINECRAFT_NAMESPACE) ? key.substring(MINECRAFT_NAMESPACE.length()) : key;
+    }
+
+    private static Map<String, EntityType> entityTypes() {
+        Map<String, EntityType> types = new HashMap<>();
+        for (EntityType type : EntityType.values()) {
+            if (type != EntityType.UNKNOWN) {
+                types.put(entityKey(type.name()), type);
+                types.put(entityKey(type.getKey().toString()), type);
+            }
+        }
+        String[][] aliases = {
+            { "mooshroom", "mushroom_cow" },
+            { "snow_golem", "snowman" },
+            { "end_crystal", "ender_crystal" },
+            { "tnt", "primed_tnt" },
+            { "leash_knot", "leash_hitch" },
+            { "item", "dropped_item" },
+            { "firework_rocket", "firework" },
+            { "experience_bottle", "thrown_exp_bottle" },
+            { "splash_potion", "potion" },
+            { "fishing_bobber", "fishing_hook" },
+            { "lightning_bolt", "lightning" },
+            { "eye_of_ender", "ender_signal" },
+            { "zombified_piglin", "zombie_pigman", "pig_zombie" },
+            { "chest_minecart", "minecart_chest" },
+            { "hopper_minecart", "minecart_hopper" },
+            { "furnace_minecart", "minecart_furnace" },
+            { "tnt_minecart", "minecart_tnt" },
+            { "spawner_minecart", "minecart_mob_spawner" },
+            { "command_block_minecart", "minecart_command" }
+        };
+        for (String[] names : aliases) {
+            for (String name : names) {
+                EntityType type = types.get(name);
+                if (type != null) {
+                    for (String alias : names) {
+                        types.putIfAbsent(alias, type);
+                    }
+                    break;
+                }
+            }
+        }
+        return Map.copyOf(types);
     }
 
     public static int getSpawnerType(EntityType type) {
@@ -139,10 +243,6 @@ public class EntityUtils {
 
     public static EntityType getSpawnerType(int type) {
         EntityType result = getEntityType(type);
-        if (result == null) {
-            result = EntityType.PIG;
-        }
-
-        return result;
+        return result == null || result == EntityType.UNKNOWN ? EntityType.PIG : result;
     }
 }

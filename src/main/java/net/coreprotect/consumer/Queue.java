@@ -1,16 +1,17 @@
 package net.coreprotect.consumer;
 
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.CreatureSpawner;
 import org.bukkit.block.data.BlockData;
@@ -29,6 +30,8 @@ import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.process.Process;
+import net.coreprotect.database.logger.ContainerLogger;
+import net.coreprotect.database.logger.ItemLogger;
 import net.coreprotect.listener.block.BlockUtil;
 import net.coreprotect.model.BlockGroup;
 import net.coreprotect.model.SignState;
@@ -38,6 +41,7 @@ import net.coreprotect.model.entity.EntityInteraction;
 import net.coreprotect.model.entity.EntityInteractionAction;
 import net.coreprotect.model.entity.EntityInteractionOrigin;
 import net.coreprotect.model.entity.EntitySpawnData;
+import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.thread.CacheHandler;
 import net.coreprotect.thread.Scheduler;
 import net.coreprotect.utility.BlockUtils;
@@ -102,30 +106,17 @@ public class Queue {
         ConfigHandler.forceContainer.remove(id);
     }
 
-    protected static synchronized int getChestId(String id) {
+    public static synchronized int getChestId(String id) {
         int chestId = ConfigHandler.loggingChest.getOrDefault(id, -1) + 1;
         ConfigHandler.loggingChest.put(id, chestId);
         return chestId;
     }
 
-    // The Queue lock keeps ItemTransactionProcess.discard from clearing an item before its generation is registered,
-    // and compute keeps the append atomic with the consumer's take in ItemLogger
-    protected static synchronized int addPendingItems(ConcurrentHashMap<String, List<ItemStack>> pendingItems, String id, ItemStack... items) {
-        pendingItems.compute(id, (key, list) -> {
-            List<ItemStack> result = list == null ? new ArrayList<>(items.length) : list;
-            Collections.addAll(result, items);
-            return result;
-        });
-        int itemId = ConfigHandler.loggingItem.getOrDefault(id, -1) + 1;
-        ConfigHandler.loggingItem.put(id, itemId);
-        return itemId;
-    }
-
     private static boolean queueStandardData(Object[] data, String[] user, Object object, boolean first, long reservation) {
-        return queueStandardData(data, user, object, first, null, null, reservation);
+        return queueStandardData(data, user, object, first, null, reservation);
     }
 
-    private static synchronized <T> boolean queueStandardData(Object[] data, String[] user, Object object, boolean first, Map<Integer, ? extends Map<Integer, T>> additionalMaps, T additionalData, long reservation) {
+    private static synchronized boolean queueStandardData(Object[] data, String[] user, Object object, boolean first, Object detail, long reservation) {
         boolean rollbackPublication = Process.isRollbackPublication((int) data[1], object);
         if (Consumer.isPersistenceHalted()) {
             Consumer.completeReservation(reservation, 1);
@@ -145,11 +136,8 @@ public class Queue {
                 user[0] = StringUtils.normalizeUsername(user[0]);
             }
             data[0] = consumerId;
-            if (additionalMaps != null) {
-                additionalMaps.get(currentConsumer).put(consumerId, additionalData);
-            }
             Consumer.consumerUsers.get(currentConsumer).put(consumerId, user);
-            Consumer.consumerObjects.get(currentConsumer).put(consumerId, object);
+            Consumer.consumerObjects.get(currentConsumer).put(consumerId, detail == null ? object : new QueuePayload(object, detail));
             if (first) {
                 Consumer.consumer.get(currentConsumer).add(0, data);
             }
@@ -164,9 +152,6 @@ public class Queue {
                     Consumer.consumer.get(currentConsumer).remove(data);
                     Consumer.consumerUsers.get(currentConsumer).remove(consumerId);
                     Consumer.consumerObjects.get(currentConsumer).remove(consumerId);
-                    if (additionalMaps != null) {
-                        additionalMaps.get(currentConsumer).remove(consumerId);
-                    }
                     if (rollbackPublication) {
                         Consumer.completeRollbackPublications(1);
                     }
@@ -187,7 +172,7 @@ public class Queue {
         queueStandardData(new Object[] { null, Process.ART_INSERT, null, 0, null, 0, id, null }, new String[] { null, null }, name, false, Consumer.reserveConsumer());
     }
 
-    protected static void queueBlockBreak(String user, BlockState block, Material type, String blockData, int extraData) {
+    public static void queueBlockBreak(String user, BlockState block, Material type, String blockData, int extraData) {
         queueBlockBreak(user, block, type, blockData, null, extraData, 0);
     }
 
@@ -204,12 +189,13 @@ public class Queue {
         }, block.getLocation(), ticks);
     }
 
-    protected static void queueBlockBreak(String user, BlockState block, Material type, String blockData, Material breakType, int extraData, int blockNumber) {
-        if (type == Material.SPAWNER && block instanceof CreatureSpawner) { // Mob spawner
+    public static void queueBlockBreak(String user, BlockState block, Material type, String blockData, Material breakType, int extraData, int blockNumber) {
+        boolean matchingMaterial = type != null && block != null && type == block.getType();
+        if (matchingMaterial && type == Material.SPAWNER && block instanceof CreatureSpawner) { // Mob spawner
             CreatureSpawner mobSpawner = (CreatureSpawner) block;
             extraData = EntityUtils.getSpawnerType(mobSpawner.getSpawnedType());
         }
-        else if (type != null && BlockGroup.LOGGED_BY_LOWER_HALF.contains(type)) { // Double plant
+        else if (matchingMaterial && BlockGroup.LOGGED_BY_LOWER_HALF.contains(type)) { // Double plant
             if (block.getBlockData() instanceof Bisected) {
                 if (((Bisected) block.getBlockData()).getHalf().equals(Half.TOP)) {
                     if (blockNumber == 5) {
@@ -227,7 +213,7 @@ public class Queue {
                 }
             }
         }
-        else if (type != null && type.name().endsWith("_BED") && block.getBlockData() instanceof Bed) {
+        else if (matchingMaterial && type.name().endsWith("_BED") && block.getBlockData() instanceof Bed) {
             if (((Bed) block.getBlockData()).getPart().equals(Part.HEAD)) {
                 return;
             }
@@ -236,14 +222,14 @@ public class Queue {
         queueStandardData(new Object[] { null, Process.BLOCK_BREAK, type, extraData, breakType, 0, blockNumber, blockData }, new String[] { user, null }, block, false, Consumer.reserveConsumer());
     }
 
-    protected static void queueBlockPlace(String user, BlockState blockLocation, Material blockType, BlockState blockReplaced, Material forceType, int forceD, int forceData, String blockData) {
+    public static void queueBlockPlace(String user, BlockState blockLocation, Material blockType, BlockState blockReplaced, Material forceType, int forceD, int forceData, String blockData) {
         // If force_data equals "1", current block data will be used in consumer.
         Material type = blockType;
         int data = 0;
         Material replaceType = null;
         int replaceData = 0;
 
-        if (type == Material.SPAWNER && blockLocation instanceof CreatureSpawner) { // Mob spawner
+        if (type == Material.SPAWNER && (forceType == null || forceType == type) && blockLocation instanceof CreatureSpawner && blockLocation.getType() == type) { // Mob spawner
             CreatureSpawner mobSpawner = (CreatureSpawner) blockLocation;
             data = EntityUtils.getSpawnerType(mobSpawner.getSpawnedType());
             forceData = 1;
@@ -253,10 +239,14 @@ public class Queue {
             replaceType = blockReplaced.getType();
             replaceData = 0;
 
-            if (replaceType != null && (replaceType == Material.IRON_DOOR || BlockGroup.DOORS.contains(replaceType) || replaceType.equals(Material.SUNFLOWER) || replaceType.equals(Material.LILAC) || replaceType.equals(Material.TALL_GRASS) || replaceType.equals(Material.LARGE_FERN) || replaceType.equals(Material.ROSE_BUSH) || replaceType.equals(Material.PEONY)) && replaceData >= 8) { // Double plant top half
+            if (BlockGroup.LOGGED_BY_LOWER_HALF.contains(replaceType) && blockReplaced.getBlockData() instanceof Bisected
+                    && ((Bisected) blockReplaced.getBlockData()).getHalf() == Half.TOP
+                    && blockReplaced.getY() > BukkitAdapter.ADAPTER.getMinHeight(blockReplaced.getWorld())) {
                 BlockState blockBelow = blockReplaced.getWorld().getBlockAt(blockReplaced.getX(), blockReplaced.getY() - 1, blockReplaced.getZ()).getState();
-                Material belowType = blockBelow.getType();
-                Queue.queueBlockBreak(user, blockBelow, belowType, blockBelow.getBlockData().getAsString(), 0);
+                if (blockBelow.getType() == replaceType && blockBelow.getBlockData() instanceof Bisected
+                        && ((Bisected) blockBelow.getBlockData()).getHalf() == Half.BOTTOM) {
+                    Queue.queueBlockBreak(user, blockBelow, replaceType, blockBelow.getBlockData().getAsString(), 0);
+                }
             }
         }
 
@@ -289,11 +279,11 @@ public class Queue {
         }, placed, ticks);
     }
 
-    protected static void queueBlockPlaceValidate(final String user, final BlockState blockLocation, final Block block, final BlockState blockReplaced, final Material forceT, final int forceD, final int forceData, final String blockData, int ticks) {
+    public static void queueBlockPlaceValidate(final String user, final BlockState blockLocation, final Block block, final BlockState blockReplaced, final Material forceT, final int forceD, final int forceData, final String blockData, int ticks) {
         queueBlockPlaceValidate(user, blockLocation, block, blockReplaced, forceT, forceD, forceData, blockData, ticks, false);
     }
 
-    protected static void queueBlockPlaceValidate(final String user, final BlockState blockLocation, final Block block, final BlockState blockReplaced, final Material forceT, final int forceD, final int forceData, final String blockData, int ticks, boolean cacheLookup) {
+    public static void queueBlockPlaceValidate(final String user, final BlockState blockLocation, final Block block, final BlockState blockReplaced, final Material forceT, final int forceD, final int forceData, final String blockData, int ticks, boolean cacheLookup) {
         Scheduler.scheduleSyncDelayedTask(CoreProtect.getInstance(), () -> {
             try {
                 Material blockType = block.getType();
@@ -328,9 +318,7 @@ public class Queue {
 
                     if (cacheLookup) {
                         Location cacheLocation = blockStateLocation.getLocation();
-                        int worldId = WorldUtils.getWorldId(cacheLocation.getWorld().getName());
-                        int unixTimestamp = (int) (System.currentTimeMillis() / 1000L);
-                        CacheHandler.lookupCache.put(cacheLocation.getBlockX() + "." + cacheLocation.getBlockY() + "." + cacheLocation.getBlockZ() + "." + worldId, new Object[] { unixTimestamp, StringUtils.normalizeUsername(user), forceT });
+                        CacheHandler.recordBlockSource(cacheLocation.getWorld(), cacheLocation.getBlockX(), cacheLocation.getBlockY(), cacheLocation.getBlockZ(), StringUtils.normalizeUsername(user), forceT);
                     }
 
                     queueBlockPlace(user, blockStateLocation, blockType, replacedBlock, forceT, forceD, forceData, blockData);
@@ -342,12 +330,20 @@ public class Queue {
         }, blockLocation.getLocation(), ticks);
     }
 
-    protected static void queueContainerBreak(String user, Location location, Material type, ItemStack[] oldInventory) {
-        queueStandardData(new Object[] { null, Process.CONTAINER_BREAK, type, 0, null, 0, 0, null }, new String[] { user, null }, location, false, Consumer.consumerContainers, oldInventory, Consumer.reserveConsumer());
+    public static void queueContainerBreak(String user, Location location, Material type, ItemStack[] oldInventory) {
+        queueStandardData(new Object[] { null, Process.CONTAINER_BREAK, type, 0, null, 0, 0, null }, new String[] { user, null }, location, false, oldInventory, Consumer.reserveConsumer());
     }
 
-    protected static synchronized void queueContainerTransaction(String user, Location location, Material type, Object inventory, int chestId) {
-        queueStandardData(new Object[] { null, Process.CONTAINER_TRANSACTION, type, 0, null, 0, chestId, null }, new String[] { user, null }, location, false, Consumer.consumerInventories, inventory, Consumer.reserveConsumer());
+    public static synchronized void queueContainerTransaction(String user, Location location, Material type, Object inventory, int chestId) {
+        queueStandardData(new Object[] { null, Process.CONTAINER_TRANSACTION, type, 0, null, 0, chestId, null }, new String[] { user, null }, location, false, inventory, Consumer.reserveConsumer());
+    }
+
+    public static void queueSpecifiedContainerTransaction(String user, Location location, Material type, BlockFace face, ItemStack[] before, ItemStack[] after) {
+        if (user == null || user.isEmpty() || location == null || location.getWorld() == null || type == null || before == null || after == null) {
+            return;
+        }
+        ContainerLogger.PreparedTransaction transaction = ContainerLogger.prepareSpecifiedTransaction(location, type, face, before, after);
+        queueStandardData(new Object[] { null, Process.CONTAINER_TRANSACTION, type, 0, null, 0, 0, null }, new String[] { user, null }, transaction, false, Consumer.reserveConsumer());
     }
 
     public static void queueEntityContainerTransaction(String user, java.util.UUID entityUuid, Location currentLocation, ItemStack[] oldContents, ItemStack[] newContents) {
@@ -389,11 +385,11 @@ public class Queue {
         queueReservedEntityInteraction(user, interaction, reserveEntityInteractionQueue());
     }
 
-    protected static long reserveEntityInteractionQueue() {
+    public static long reserveEntityInteractionQueue() {
         return Consumer.reserveConsumer();
     }
 
-    protected static void queueReservedEntityInteraction(String user, EntityInteraction interaction, long reservation) {
+    public static void queueReservedEntityInteraction(String user, EntityInteraction interaction, long reservation) {
         boolean queued = false;
         try {
             if (user == null || user.trim().isEmpty() || interaction == null) {
@@ -409,19 +405,60 @@ public class Queue {
         }
     }
 
-    protected static void queueItemTransaction(String user, Location location, int time, int offset, int itemId) {
-        queueStandardData(new Object[] { null, Process.ITEM_TRANSACTION, null, offset, null, time, itemId, null }, new String[] { user, null }, location, false, Consumer.reserveConsumer());
+    public static void queuePendingItems(String user, Location location, int time, int offset, int action, ItemStack... items) {
+        queuePendingItems(user, location, time, offset, Map.of(action, Arrays.asList(items)));
+    }
+
+    public static void queuePendingItems(String user, Location location, int time, int offset, Map<Integer, List<ItemStack>> groups) {
+        Map<Integer, List<ItemStack>> snapshots = new HashMap<>();
+        for (Map.Entry<Integer, List<ItemStack>> entry : groups.entrySet()) {
+            List<ItemStack> items = new ArrayList<>();
+            for (ItemStack item : entry.getValue()) {
+                if (item != null && !BlockUtils.isAir(item.getType()) && item.getAmount() > 0) {
+                    items.add(item.clone());
+                }
+            }
+            if (!items.isEmpty()) {
+                ItemLogger.pendingItems(entry.getKey());
+                snapshots.put(entry.getKey(), items);
+            }
+        }
+        if (snapshots.isEmpty()) {
+            return;
+        }
+
+        Location position = location.clone();
+        String key = ItemLogger.getLoggingId(user, position);
+        synchronized (Queue.class) {
+            int generation = ConfigHandler.loggingItem.getOrDefault(key, -1) + 1;
+            if (queueItemTransaction(user, position, time, offset, generation)) {
+                snapshots.forEach((action, items) -> ItemLogger.pendingItems(action).computeIfAbsent(key, ignored -> new ArrayList<>()).addAll(items));
+                ConfigHandler.loggingItem.put(key, generation);
+            }
+        }
+    }
+
+    public static boolean queueItemTransaction(String user, Location location, int time, int offset, int itemId) {
+        return queueStandardData(new Object[] { null, Process.ITEM_TRANSACTION, null, offset, null, time, itemId, null }, new String[] { user, null }, location, false, Consumer.reserveConsumer());
     }
 
     protected static void queueEntityInsert(int id, String name) {
         queueStandardData(new Object[] { null, Process.ENTITY_INSERT, null, 0, null, 0, id, null }, new String[] { null, null }, name, false, Consumer.reserveConsumer());
     }
 
-    protected static void queueEntityKill(String user, Location location, List<Object> data, EntityType type) {
-        queueStandardData(new Object[] { null, Process.ENTITY_KILL, null, 0, null, 0, 0 }, new String[] { user, null }, new Object[] { getBlockLocation(location), type, null }, false, Consumer.consumerObjectList, data, Consumer.reserveConsumer());
+    public static void queueEntityKill(String user, Location location, List<Object> data, EntityType type) {
+        queueStandardData(new Object[] { null, Process.ENTITY_KILL, null, 0, null, 0, 0, null }, new String[] { user, null }, new Object[] { getBlockLocation(location), type, null }, false, data, Consumer.reserveConsumer());
     }
 
     protected static void queueEntitySpawn(String user, BlockState block, EntityType type, int data) {
+        enqueueEntitySpawn(user, block, type, data);
+    }
+
+    protected static void queueEntitySpawn(String user, BlockState block, int storedTypeId, int data) {
+        enqueueEntitySpawn(user, block, storedTypeId, data);
+    }
+
+    private static void enqueueEntitySpawn(String user, BlockState block, Object type, int data) {
         queueStandardData(new Object[] { null, Process.ENTITY_SPAWN, null, 0, null, 0, data, null }, new String[] { user, null }, new Object[] { block, type }, false, Consumer.reserveConsumer());
     }
 
@@ -474,8 +511,8 @@ public class Queue {
         queueEntitySpawnUpdate(EntitySpawnData.revived(previousUuid, uuid, location));
     }
 
-    public static void queueEntitySpawnUpdate(EntitySpawnData update) {
-        queueStandardData(new Object[] { null, Process.ENTITY_SPAWN_UPDATE, null, 0, null, 0, 0, null }, new String[] { null, null }, update, false, Consumer.reserveConsumer());
+    public static boolean queueEntitySpawnUpdate(EntitySpawnData update) {
+        return queueStandardData(new Object[] { null, Process.ENTITY_SPAWN_UPDATE, null, 0, null, 0, 0, null }, new String[] { null, null }, update, false, Consumer.reserveConsumer());
     }
 
     public static void queueEntitySpawnUpdateFirst(EntitySpawnData update) {
@@ -490,56 +527,84 @@ public class Queue {
         queueStandardData(new Object[] { null, Process.BLOCKDATA_INSERT, null, 0, null, 0, id, null }, new String[] { null, null }, data, false, Consumer.reserveConsumer());
     }
 
-    protected static void queueNaturalBlockBreak(String user, BlockState block, Block relative, Material type, String blockData, int data) {
+    public static void queueNaturalBlockBreak(String user, BlockState block, Block relative, Material type, String blockData, int data) {
         List<BlockState> blockStates = new ArrayList<>();
         if (relative != null) {
             blockStates.add(relative.getState());
         }
 
-        queueStandardData(new Object[] { null, Process.NATURAL_BLOCK_BREAK, type, data, null, 0, 0, blockData }, new String[] { user, null }, block, false, Consumer.consumerBlockList, blockStates, Consumer.reserveConsumer());
+        queueStandardData(new Object[] { null, Process.NATURAL_BLOCK_BREAK, type, data, null, 0, 0, blockData }, new String[] { user, null }, block, false, blockStates, Consumer.reserveConsumer());
     }
 
-    protected static void queuePlayerChat(Player player, String message, long timestamp) {
-        queueStandardData(new Object[] { null, Process.PLAYER_CHAT, null, 0, null, 0, 0, null }, new String[] { player.getName(), null }, new Object[] { timestamp, player.getLocation().clone() }, false, Consumer.consumerStrings, message, Consumer.reserveConsumer());
+    public static boolean queuePlayerChat(Player player, String message, long timestamp, boolean cancelled) {
+        if (message == null || message.isEmpty() || message.startsWith("/")) {
+            return false;
+        }
+        boolean folia = ConfigHandler.isFolia;
+        if (folia ? PaperAdapter.ADAPTER.isOwnedByCurrentRegion(player) : Bukkit.isPrimaryThread()) {
+            return capturePlayerChat(player, message, timestamp, cancelled);
+        }
+        CoreProtect plugin = CoreProtect.getInstance();
+        if (plugin == null) {
+            return false;
+        }
+        Runnable capture = () -> capturePlayerChat(player, message, timestamp, cancelled);
+        if (folia) {
+            return PaperAdapter.ADAPTER.executeEntityTask(plugin, player, capture, null);
+        }
+        Scheduler.runTask(plugin, capture, player);
+        return true;
     }
 
-    protected static void queuePlayerCommand(Player player, String message, long timestamp) {
-        queueStandardData(new Object[] { null, Process.PLAYER_COMMAND, null, 0, null, 0, 0, null }, new String[] { player.getName(), null }, new Object[] { timestamp, player.getLocation().clone() }, false, Consumer.consumerStrings, message, Consumer.reserveConsumer());
+    private static boolean capturePlayerChat(Player player, String message, long timestamp, boolean cancelled) {
+        Location location = player.getLocation();
+        if (location == null || location.getWorld() == null) {
+            return false;
+        }
+        Config config = Config.getConfig(location.getWorld());
+        if (!config.PLAYER_MESSAGES || (cancelled && !config.LOG_CANCELLED_CHAT)) {
+            return false;
+        }
+        return queueStandardData(new Object[] { null, Process.PLAYER_CHAT, null, 0, null, 0, 0, null }, new String[] { player.getName(), null }, new Object[] { timestamp, location.clone() }, false, message, Consumer.reserveConsumer());
     }
 
-    protected static void queuePlayerInteraction(String user, BlockState block, Material type) {
+    public static void queuePlayerCommand(Player player, String message, long timestamp) {
+        queuePlayerCommand(player, message, timestamp, player.getLocation());
+    }
+
+    protected static boolean queuePlayerCommand(Player player, String message, long timestamp, Location location) {
+        if (location == null || location.getWorld() == null) {
+            return false;
+        }
+        return queueStandardData(new Object[] { null, Process.PLAYER_COMMAND, null, 0, null, 0, 0, null }, new String[] { player.getName(), null }, new Object[] { timestamp, location.clone() }, false, message, Consumer.reserveConsumer());
+    }
+
+    public static void queuePlayerInteraction(String user, BlockState block, Material type) {
         queuePlayerInteraction(user, block.getLocation(), type, block.getBlockData().getAsString());
     }
 
-    protected static void queuePlayerInteraction(String user, Location location, Material type, String blockData) {
+    public static void queuePlayerInteraction(String user, Location location, Material type, String blockData) {
         queueStandardData(new Object[] { null, Process.PLAYER_INTERACTION, type, 0, null, 0, 0, blockData }, new String[] { user, null }, getBlockLocation(location), false, Consumer.reserveConsumer());
     }
 
-    protected static void queuePlayerKill(String user, Location location, String player) {
+    public static void queuePlayerKill(String user, Location location, String player) {
         queueStandardData(new Object[] { null, Process.PLAYER_KILL, null, 0, null, 0, 0, null }, new String[] { user, null }, new Object[] { getBlockLocation(location), player }, false, Consumer.reserveConsumer());
     }
 
-    protected static void queuePlayerLogin(Player player, int time, int configSessions, int configUsernames) {
+    public static void queuePlayerLogin(Player player, int time, int configSessions, int configUsernames) {
         String uuid = player.getUniqueId().toString();
-        queueStandardData(new Object[] { null, Process.PLAYER_LOGIN, null, configSessions, null, configUsernames, time, null }, new String[] { player.getName(), uuid }, player.getLocation().clone(), false, Consumer.consumerStrings, uuid, Consumer.reserveConsumer());
+        queueStandardData(new Object[] { null, Process.PLAYER_LOGIN, null, configSessions, null, configUsernames, time, null }, new String[] { player.getName(), uuid }, player.getLocation().clone(), false, uuid, Consumer.reserveConsumer());
     }
 
-    protected static void queuePlayerQuit(Player player, int time) {
+    public static void queuePlayerQuit(Player player, int time) {
         queueStandardData(new Object[] { null, Process.PLAYER_LOGOUT, null, 0, null, 0, time, null }, new String[] { player.getName(), null }, player.getLocation().clone(), false, Consumer.reserveConsumer());
     }
 
     protected static void queueRollbackUpdate(String user, Location location, List<Object[]> list, int table, int action) {
-        if (location == null) {
-            location = new Location(Bukkit.getServer().getWorlds().get(0), 0, 0, 0);
-        }
-
         queueRollbackUpdates(user, location, list, table, action, false);
     }
 
     public static void queueEntityContainerRollbackUpdate(String user, Location location, List<Object[]> rows, int rollbackType, boolean inventoryRollback) {
-        if (location == null) {
-            location = new Location(Bukkit.getServer().getWorlds().get(0), 0, 0, 0);
-        }
         queueRollbackUpdates(user, location, rows, Process.ENTITY_CONTAINER_ROLLBACK_UPDATE, rollbackType, inventoryRollback);
     }
 
@@ -633,8 +698,8 @@ public class Queue {
                 int consumerId = firstConsumerId + recordIndex;
                 records.add(new Object[] { consumerId, table, null, inventoryRollback ? 1 : 0, null, 0, action, null });
                 Consumer.consumerUsers.get(currentConsumer).put(consumerId, new String[] { normalizedUser, null });
-                Consumer.consumerObjects.get(currentConsumer).put(consumerId, location);
-                Consumer.consumerObjectArrayList.get(currentConsumer).put(consumerId, new ArrayList<>(rows.subList(fromIndex, toIndex)));
+                QueuePayload payload = new QueuePayload(location, new ArrayList<>(rows.subList(fromIndex, toIndex)));
+                Consumer.consumerObjects.get(currentConsumer).put(consumerId, payload);
             }
             Consumer.consumer.get(currentConsumer).addAll(records);
             published = true;
@@ -647,7 +712,6 @@ public class Queue {
                         int consumerId = firstConsumerId + recordIndex;
                         Consumer.consumerUsers.get(currentConsumer).remove(consumerId);
                         Consumer.consumerObjects.get(currentConsumer).remove(consumerId);
-                        Consumer.consumerObjectArrayList.get(currentConsumer).remove(consumerId);
                     }
                     if (registered) {
                         Consumer.completeRollbackPublications(recordCount);
@@ -660,18 +724,18 @@ public class Queue {
         }
     }
 
-    protected static void queueSignText(String user, Location location, int action, SignState state, boolean isFront, int offset) {
+    public static void queueSignText(String user, Location location, int action, SignState state, boolean isFront, int offset) {
         queueSignText(user, location, action, state.getColor(true), state.getColor(false), state.isGlowing(true), state.isGlowing(false), state.isWaxed(), isFront,
                 state.getLine(0), state.getLine(1), state.getLine(2), state.getLine(3), state.getLine(4), state.getLine(5), state.getLine(6), state.getLine(7), offset);
     }
 
-    protected static void queueSignText(String user, Location location, int action, int color, int colorSecondary, boolean frontGlowing, boolean backGlowing, boolean isWaxed, boolean isFront, String line1, String line2, String line3, String line4, String line5, String line6, String line7, String line8, int offset) {
+    public static void queueSignText(String user, Location location, int action, int color, int colorSecondary, boolean frontGlowing, boolean backGlowing, boolean isWaxed, boolean isFront, String line1, String line2, String line3, String line4, String line5, String line6, String line7, String line8, int offset) {
         Object[] signData = new Object[] { colorSecondary, BlockUtils.getSignData(frontGlowing, backGlowing), isWaxed, isFront, line1, line2, line3, line4, line5, line6, line7, line8 };
-        queueStandardData(new Object[] { null, Process.SIGN_TEXT, null, color, null, action, offset, null }, new String[] { user, null }, location, false, Consumer.consumerSigns, signData, Consumer.reserveConsumer());
+        queueStandardData(new Object[] { null, Process.SIGN_TEXT, null, color, null, action, offset, null }, new String[] { user, null }, location, false, signData, Consumer.reserveConsumer());
     }
 
-    protected static void queueSignUpdate(String user, BlockState block, int action, int time) {
-        queueStandardData(new Object[] { null, Process.SIGN_UPDATE, null, action, null, 0, time, null }, new String[] { user, null }, block, false, Consumer.reserveConsumer());
+    protected static void queueSignUpdate(int userId, BlockState block, int action, int time) {
+        queueStandardData(new Object[] { null, Process.SIGN_UPDATE, null, action, null, userId, time, null }, new String[] { null, null }, block, false, Consumer.reserveConsumer());
     }
 
     protected static void queueSkullUpdate(String user, BlockState block, int rowId) {
@@ -679,7 +743,7 @@ public class Queue {
     }
 
     protected static void queueStructureGrow(String user, BlockState block, List<BlockState> blockList, int replacedListSize) {
-        queueStandardData(new Object[] { null, Process.STRUCTURE_GROWTH, null, 0, null, 0, replacedListSize, null }, new String[] { user, null }, block, false, Consumer.consumerBlockList, blockList, Consumer.reserveConsumer());
+        queueStandardData(new Object[] { null, Process.STRUCTURE_GROWTH, null, 0, null, 0, replacedListSize, null }, new String[] { user, null }, block, false, blockList, Consumer.reserveConsumer());
     }
 
     protected static void queueWorldInsert(int id, String world) {

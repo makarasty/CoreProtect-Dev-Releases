@@ -32,6 +32,7 @@ import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.database.rollback.RollbackUtil.ContainerReplayResult;
 import net.coreprotect.database.statement.EntityStatement;
 import net.coreprotect.listener.player.EntityInteractionListener;
 import net.coreprotect.listener.player.InventoryChangeListener;
@@ -41,7 +42,6 @@ import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.thread.Scheduler;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.EntitySpawnTracking;
-import net.coreprotect.utility.EntityUtils;
 import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.MaterialUtils;
@@ -101,7 +101,7 @@ public final class EntitySpawnRollbackHandler {
             if (rollbackType == 0 && record.isRemoved()) {
                 pairedKillRows.add(record.getKillRowId());
                 List<Object> data = killData.get(record.getKillRowId());
-                EntityType type = EntityUtils.getEntityType((Integer) killRow[6]);
+                EntityType type = EntitySpawnTracking.resolveKillType((Integer) killRow[6], data);
                 Location location = getRowLocation(killRow);
                 if (location != null && EntitySpawnTracking.isPlacedEntityType(type)) {
                     Location exactLocation = EntitySpawnTracking.getKillRestoreLocation(location.getWorld(), data);
@@ -170,7 +170,7 @@ public final class EntitySpawnRollbackHandler {
             }
             else {
                 Location location = record.getLocation();
-                EntityType type = EntityUtils.getEntityType((Integer) row[6]);
+                EntityType type = EntitySpawnTracking.resolveSpawnType((Integer) row[6], record.getState());
                 if (record.getState() == null || location == null || type == null || type == EntityType.UNKNOWN) {
                     continue;
                 }
@@ -195,7 +195,7 @@ public final class EntitySpawnRollbackHandler {
             List<Object[]> transactions = containerRowsByTrackingId.getOrDefault(record.getRowId(), Collections.emptyList());
             if (rollbackType == 0) {
                 List<Object> data = killData.get(killRowId);
-                EntityType type = EntityUtils.getEntityType((Integer) row[6]);
+                EntityType type = EntitySpawnTracking.resolveKillType((Integer) row[6], data);
                 Location location = getRowLocation(row);
                 if (location != null && EntitySpawnTracking.isPlacedEntityType(type)) {
                     Location exactLocation = EntitySpawnTracking.getKillRestoreLocation(location.getWorld(), data);
@@ -565,7 +565,7 @@ public final class EntitySpawnRollbackHandler {
     }
 
     private static CompletableFuture<Boolean> mutateEntity(Context context, Work work, Entity entity) {
-        if (work.operation == WorkOperation.CONTAINER_ROLLBACK || work.operation == WorkOperation.CONTAINER_RESTORE) {
+        if (work.operation.isContainerOnly()) {
             return applyContainerOnly(context, work, entity);
         }
         return removeEntity(context, work, entity);
@@ -667,7 +667,9 @@ public final class EntitySpawnRollbackHandler {
                 Entity entity = null;
                 try {
                     entity = work.location.getWorld().spawnEntity(work.location, work.type);
-                    EntitySpawnTracking.restoreState(entity, work.record.getState());
+                    if (entity != null && entity.isValid()) {
+                        EntitySpawnTracking.restoreState(entity, work.record.getState());
+                    }
                     completeFrom(completion, completeRestoredEntity(context, work, entity));
                 }
                 catch (Exception e) {
@@ -705,12 +707,6 @@ public final class EntitySpawnRollbackHandler {
                             ? "Entity restoration timed out after 30 seconds" : "Entity restoration failed", work);
                     context.cancel();
                     ErrorReporter.report(throwable);
-                    completion.complete(false);
-                    context.endMutation();
-                    return;
-                }
-                if (entity == null) {
-                    context.reportFailure("Entity restoration did not return an entity", work);
                     completion.complete(false);
                     context.endMutation();
                     return;
@@ -763,6 +759,12 @@ public final class EntitySpawnRollbackHandler {
         CompletableFuture<Boolean> completion = new CompletableFuture<>();
         boolean retained = false;
         try {
+            if (entity == null || !entity.isValid()) {
+                context.reportFailure("Entity restoration did not produce a valid entity", work);
+                context.cancel();
+                completion.complete(false);
+                return completion;
+            }
             if (!applyPreparedTransactions(context, work, entity) || (context.isCancelled() && !work.transactionContentsApplied)) {
                 context.cancel();
                 completion.complete(false);
@@ -784,7 +786,7 @@ public final class EntitySpawnRollbackHandler {
                     EntitySpawnTracking.removeWithoutRemovalLog(entity);
                 }
                 EntitySpawnTracking.forget(entity.getUniqueId());
-                completion.complete(context.compositeTransition(work, transition, 2));
+                completion.complete(context.transition(work, transition, 2));
                 return completion;
             }
 
@@ -807,11 +809,11 @@ public final class EntitySpawnRollbackHandler {
         finally {
             try {
                 if (!retained) {
-                    EntitySpawnTracking.forget(entity.getUniqueId());
-                    if (entity.isValid()) {
-                        EntitySpawnTracking.removeWithoutRemovalLog(entity);
-                    }
+                    discardRestoredEntity(entity);
                 }
+            }
+            catch (Exception cleanupException) {
+                ErrorReporter.report(cleanupException);
             }
             finally {
                 context.endMutation();
@@ -942,8 +944,7 @@ public final class EntitySpawnRollbackHandler {
             context.reportFailure("Restored entity inventory does not match its recorded contents, size, or stack limit", work);
             return false;
         }
-        inventory.setStorageContents(ItemUtils.getContainerState(work.transactionContents));
-        work.transactionContentsApplied = true;
+        work.commitTransactionContents(inventory);
         return true;
     }
 
@@ -976,8 +977,7 @@ public final class EntitySpawnRollbackHandler {
                 completion.complete(false);
                 return;
             }
-            inventory.setStorageContents(ItemUtils.getContainerState(work.transactionContents));
-            work.transactionContentsApplied = true;
+            work.commitTransactionContents(inventory);
             completion.complete(true);
         }
         catch (Exception e) {
@@ -1029,13 +1029,22 @@ public final class EntitySpawnRollbackHandler {
         try {
             while (work.transactionIndex < work.transactions.size()) {
                 Object[] row = work.transactions.get(work.transactionIndex);
-                if (!applyTransaction(context.rollbackType, work.transactionContents, work.inventoryMaxStackSize, row)) {
+                int rowAction = row[8] instanceof Integer ? (Integer) row[8] : -1;
+                ItemStack item = rowAction == 0 || rowAction == 1 ? transactionItem(row) : null;
+                if (item == null) {
                     context.reportFailure("Invalid entity inventory transaction (rowid: " + row[0] + ", material: " + row[6] + ", amount: " + row[11] + ")", work);
                     return TransactionStep.FAILED;
                 }
+                ContainerReplayResult result = RollbackUtil.replayStorageItems(work.transactionContents, item, rowAction == context.rollbackType, work.inventoryMaxStackSize);
+                if (result.applied()) {
+                    work.appliedTransactions.add(row);
+                    work.appliedItemCount += result.modifiedAmount();
+                }
+                else if (!work.operation.isContainerOnly()) {
+                    context.reportFailure("Entity inventory transaction could not be applied in full (rowid: " + row[0] + ")", work);
+                    return TransactionStep.FAILED;
+                }
                 work.transactionIndex++;
-                work.appliedTransactions.add(row);
-                work.appliedItemCount += (Integer) row[11];
                 processed++;
                 if (work.transactionIndex < work.transactions.size() && (processed >= budget.mutations || System.nanoTime() - stepStart >= budget.nanos)) {
                     return TransactionStep.PENDING;
@@ -1079,70 +1088,20 @@ public final class EntitySpawnRollbackHandler {
         }
     }
 
-    private static boolean applyTransaction(int rollbackType, ItemStack[] contents, int inventoryMaxStackSize, Object[] row) {
+    private static ItemStack transactionItem(Object[] row) {
         Material rowType = MaterialUtils.getType((Integer) row[6]);
         int rowAmount = (Integer) row[11];
         if (rowType == null || rowAmount <= 0) {
-            return false;
+            return null;
         }
 
         ItemStack itemStack = new ItemStack(rowType, rowAmount);
         Object[] populatedStack = RollbackItemHandler.populateItemStack(itemStack, (byte[]) row[12]);
-        int rowAction = (Integer) row[8];
-        int action = ((rollbackType == 0 && rowAction == 0) || (rollbackType == 1 && rowAction == 1)) ? 1 : 0;
-        return populatedStack[2] instanceof ItemStack && modifyTransactionContents(contents, (ItemStack) populatedStack[2], action, inventoryMaxStackSize);
-    }
-
-    private static boolean modifyTransactionContents(ItemStack[] contents, ItemStack itemStack, int action, int inventoryMaxStackSize) {
-        int remaining = itemStack.getAmount();
-        if (action == 0) {
-            for (int index = contents.length - 1; index >= 0 && remaining > 0; index--) {
-                ItemStack current = contents[index];
-                if (current == null || !current.isSimilar(itemStack)) {
-                    continue;
-                }
-                int removed = Math.min(remaining, current.getAmount());
-                remaining -= removed;
-                if (removed == current.getAmount()) {
-                    contents[index] = null;
-                }
-                else {
-                    current.setAmount(current.getAmount() - removed);
-                }
-            }
-            return true;
+        ItemStack item = populatedStack[2] instanceof ItemStack ? (ItemStack) populatedStack[2] : null;
+        if (ItemUtils.isEmptyContainerSlot(item) || item.getAmount() != rowAmount) {
+            return null;
         }
-
-        int maxStackSize = itemStack.getMaxStackSize();
-        if (inventoryMaxStackSize > 0 && (maxStackSize < 0 || inventoryMaxStackSize < maxStackSize)) {
-            maxStackSize = inventoryMaxStackSize;
-        }
-        if (maxStackSize < 1) {
-            maxStackSize = 1;
-        }
-        for (ItemStack current : contents) {
-            if (remaining <= 0) {
-                return true;
-            }
-            if (current == null || !current.isSimilar(itemStack) || current.getAmount() >= maxStackSize) {
-                continue;
-            }
-            int added = Math.min(remaining, maxStackSize - current.getAmount());
-            current.setAmount(current.getAmount() + added);
-            remaining -= added;
-        }
-        for (int index = 0; index < contents.length && remaining > 0; index++) {
-            ItemStack current = contents[index];
-            if (current != null && current.getType() != Material.AIR) {
-                continue;
-            }
-            int added = Math.min(remaining, maxStackSize);
-            ItemStack addedItem = itemStack.clone();
-            addedItem.setAmount(added);
-            contents[index] = addedItem;
-            remaining -= added;
-        }
-        return true;
+        return item;
     }
 
     private static void scheduleTransactionStart(Context context, Work work, Entity entity, CompletableFuture<Boolean> completion) {
@@ -1407,9 +1366,11 @@ public final class EntitySpawnRollbackHandler {
         private final List<CompletableFuture<Boolean>> pending = new ArrayList<>();
         private final Deque<TransactionWork> transactionWaiters = new ArrayDeque<>();
         private final AtomicInteger items = new AtomicInteger();
+        private final AtomicInteger blocks = new AtomicInteger();
         private final AtomicInteger entities = new AtomicInteger();
         private final AtomicBoolean cancelled = new AtomicBoolean();
         private final AtomicBoolean failureReported = new AtomicBoolean();
+        private Map<Integer, List<Object>> legacyKillData = Collections.emptyMap();
         private int activeMutations;
         private boolean transactionWorkActive;
         private boolean transactionWorkAdvancing;
@@ -1472,6 +1433,36 @@ public final class EntitySpawnRollbackHandler {
             return items.get();
         }
 
+        int getBlockCount() {
+            return blocks.get();
+        }
+
+        void addChunkCounts(RollbackCounters counters) {
+            items.addAndGet(counters.getItems());
+            blocks.addAndGet(counters.getBlocks());
+            entities.addAndGet(counters.getEntities());
+        }
+
+        void setLegacyKillData(Map<Integer, List<Object>> legacyKillData) {
+            this.legacyKillData = legacyKillData;
+        }
+
+        List<Object> getLegacyKillData(int id) {
+            return legacyKillData.getOrDefault(id, Collections.emptyList());
+        }
+
+        void addEntityCount() {
+            entities.incrementAndGet();
+        }
+
+        void addBlockCount() {
+            blocks.incrementAndGet();
+        }
+
+        String actor() {
+            return userString;
+        }
+
         void addItemCount(int count) {
             items.addAndGet(count);
         }
@@ -1487,12 +1478,11 @@ public final class EntitySpawnRollbackHandler {
         }
 
         boolean isCancelled() {
-            int[] rollbackData = ConfigHandler.rollbackHash.get(userString);
             if (!cancelled.get() && preview == 0 && Consumer.isPersistenceHalted()) {
                 reportFailure("Database persistence is halted", null);
                 return true;
             }
-            return cancelled.get() || (rollbackData != null && rollbackData[3] == 2);
+            return cancelled.get();
         }
 
         void reportFailure(String reason, Work value) {
@@ -1618,30 +1608,10 @@ public final class EntitySpawnRollbackHandler {
             }
             releaseClaim(value.record.getRowId());
             entities.addAndGet(count);
-            items.addAndGet(value.transactionItemCount);
             return true;
         }
 
         private boolean transition(Work value, EntitySpawnData data, int count) {
-            if (!value.complete.compareAndSet(false, true)) {
-                return true;
-            }
-            try {
-                publishTransition(data, value.appliedTransactions);
-                claimedRows.remove(value.record.getRowId());
-                items.addAndGet(value.appliedItemCount);
-                entities.addAndGet(count);
-                return true;
-            }
-            catch (Exception e) {
-                releaseClaim(value.record.getRowId());
-                cancel();
-                ErrorReporter.report(e);
-                return false;
-            }
-        }
-
-        private boolean compositeTransition(Work value, EntitySpawnData data, int count) {
             if (!value.complete.compareAndSet(false, true)) {
                 return true;
             }
@@ -1681,13 +1651,11 @@ public final class EntitySpawnRollbackHandler {
         private boolean transition(NoWorldTransition value) {
             if (preview > 0) {
                 entities.addAndGet(value.count);
-                items.addAndGet(value.transactionItemCount);
                 return true;
             }
             try {
                 publishTransition(value.data, value.transactions);
                 claimedRows.remove(value.trackingRowId);
-                items.addAndGet(value.transactionItemCount);
                 entities.addAndGet(value.count);
                 return true;
             }
@@ -1743,6 +1711,10 @@ public final class EntitySpawnRollbackHandler {
             return createsEntity;
         }
 
+        private boolean isContainerOnly() {
+            return this == CONTAINER_ROLLBACK || this == CONTAINER_RESTORE;
+        }
+
         private boolean enforcesCurrentRadius() {
             return currentRadius;
         }
@@ -1782,14 +1754,12 @@ public final class EntitySpawnRollbackHandler {
         private final EntitySpawnData data;
         private final int count;
         private final List<Object[]> transactions;
-        private final int transactionItemCount;
 
         private NoWorldTransition(int trackingRowId, EntitySpawnData data, int count, List<Object[]> transactions) {
             this.trackingRowId = trackingRowId;
             this.data = data;
             this.count = count;
             this.transactions = new ArrayList<>(transactions);
-            this.transactionItemCount = Work.itemCount(transactions);
         }
 
         private static NoWorldTransition compositeRestore(EntitySpawnRecord record, long spawnBlockRowId, long killBlockRowId, List<Object[]> transactions) {
@@ -1812,7 +1782,6 @@ public final class EntitySpawnRollbackHandler {
         private final List<Object> killData;
         private final List<Object[]> transactions;
         private final List<Object[]> appliedTransactions = new ArrayList<>();
-        private final int transactionItemCount;
         private final AtomicBoolean complete = new AtomicBoolean();
         private final AtomicInteger locationRetries = new AtomicInteger();
         private int transactionIndex;
@@ -1833,7 +1802,6 @@ public final class EntitySpawnRollbackHandler {
             this.location = location == null ? null : location.clone();
             this.killData = killData;
             this.transactions = new ArrayList<>(transactions);
-            this.transactionItemCount = itemCount(transactions);
         }
 
         private static Work spawnRemoval(long blockRowId, EntitySpawnRecord record, Location location, List<Object[]> transactions) {
@@ -1861,16 +1829,6 @@ public final class EntitySpawnRollbackHandler {
             return new Work(0, 0, 0, record, operation, null, location, null, transactions);
         }
 
-        private static int itemCount(List<Object[]> transactions) {
-            int result = 0;
-            for (Object[] row : transactions) {
-                if (row.length > 11 && row[11] instanceof Integer) {
-                    result += (Integer) row[11];
-                }
-            }
-            return result;
-        }
-
         private void initializeTransactionContents(Inventory inventory) {
             if (transactionContents != null) {
                 return;
@@ -1878,6 +1836,13 @@ public final class EntitySpawnRollbackHandler {
             originalTransactionContents = ItemUtils.getContainerState(inventory.getStorageContents());
             transactionContents = ItemUtils.getContainerState(originalTransactionContents);
             inventoryMaxStackSize = inventory.getMaxStackSize();
+        }
+
+        private void commitTransactionContents(Inventory inventory) {
+            if (appliedItemCount > 0) {
+                inventory.setStorageContents(ItemUtils.getContainerState(transactionContents));
+            }
+            transactionContentsApplied = true;
         }
 
         private boolean initializeCreatedTransactionContents() {

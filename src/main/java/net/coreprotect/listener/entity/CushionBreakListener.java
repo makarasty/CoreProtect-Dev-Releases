@@ -15,7 +15,7 @@ import net.coreprotect.listener.player.EntityInteractionListener;
 import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.EntityUtils;
 
-public final class CushionBreakListener extends Queue implements Listener {
+public final class CushionBreakListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onHangingBreak(HangingBreakEvent event) {
@@ -39,9 +39,6 @@ public final class CushionBreakListener extends Queue implements Listener {
             Queue.queueEntityKill(user, entity.getLocation(), EntitySpawnTracking.serializeKillData(entity), entity.getType());
         }
 
-        if (EntitySpawnTracking.isTrackedOrPendingIdentity(entity)) {
-            Queue.queueEntitySpawnRemoved(entity);
-            EntitySpawnTracking.clearTracking(entity.getUniqueId());
-        }
+        EntitySpawnTracking.recordRemoval(entity);
     }
 }

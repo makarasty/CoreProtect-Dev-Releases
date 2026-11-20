@@ -3,13 +3,12 @@ package net.coreprotect.database.logger;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 
-import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.inventory.ItemStack;
 
-import net.coreprotect.CoreProtect;
-import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.ConsumerWriteBatch;
@@ -20,6 +19,7 @@ import net.coreprotect.model.item.ItemTransactionActions;
 import net.coreprotect.utility.BlockUtils;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.MaterialUtils;
+import net.coreprotect.utility.StringUtils;
 import net.coreprotect.utility.WorldUtils;
 import net.coreprotect.utility.serialize.ItemMetaHandler;
 
@@ -57,7 +57,7 @@ public class ItemLogger {
     }
 
     public static PreparedTransaction prepare(Location location, int offset, String user) {
-        String key = user.toLowerCase(Locale.ROOT) + "." + location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ();
+        String key = getLoggingId(user, location);
         ItemStack[][] items = {
                 take(ConfigHandler.itemsPickup, key), take(ConfigHandler.itemsDrop, key),
                 take(ConfigHandler.itemsThrown, key), take(ConfigHandler.itemsShot, key),
@@ -65,6 +65,28 @@ public class ItemLogger {
                 take(ConfigHandler.itemsCreate, key), take(ConfigHandler.itemsSell, key), take(ConfigHandler.itemsBuy, key)
         };
         return new PreparedTransaction(location, (int) (System.currentTimeMillis() / 1000L) - offset, items);
+    }
+
+    public static String getLoggingId(String user, Location location) {
+        World world = location.getWorld();
+        UUID worldId = world == null ? null : world.getUID();
+        String worldKey = worldId == null ? (world == null ? "" : world.getName()) : worldId.toString();
+        return StringUtils.normalizeUsername(user).toLowerCase(Locale.ROOT) + "." + location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ() + "." + worldKey;
+    }
+
+    public static Map<String, List<ItemStack>> pendingItems(int action) {
+        switch (action) {
+            case ITEM_PICKUP: return ConfigHandler.itemsPickup;
+            case ITEM_DROP: return ConfigHandler.itemsDrop;
+            case ITEM_THROW: return ConfigHandler.itemsThrown;
+            case ITEM_SHOOT: return ConfigHandler.itemsShot;
+            case ITEM_BREAK: return ConfigHandler.itemsBreak;
+            case ITEM_DESTROY: return ConfigHandler.itemsDestroy;
+            case ITEM_CREATE: return ConfigHandler.itemsCreate;
+            case ITEM_SELL: return ConfigHandler.itemsSell;
+            case ITEM_BUY: return ConfigHandler.itemsBuy;
+            default: throw new IllegalArgumentException("Unsupported pending item action " + action);
+        }
     }
 
     // Removing the whole list means an item appended after this point starts a new list for the next transaction.
@@ -112,20 +134,16 @@ public class ItemLogger {
                         continue;
                     }
 
+                    CoreProtectPreLogEvent event = LoggerPreLog.fire(user, location, CoreProtectPreLogEvent.Action.ITEM_TRANSACTION, action, item.getType(), null, null);
+                    if (event == null || ConfigHandler.isFilterBlacklisted(event.getUser(), item.getType().getKey().toString())) {
+                        continue;
+                    }
+
                     List<List<Map<String, Object>>> data = ItemMetaHandler.serialize(item, null, null, 0);
-                    if (data.size() == 0) {
+                    if (data.isEmpty()) {
                         data = null;
                     }
 
-                    CoreProtectPreLogEvent event = new CoreProtectPreLogEvent(user, location, CoreProtectPreLogEvent.Action.ITEM_TRANSACTION, action, item.getType(), null, null);
-                    if (Config.getGlobal().API_ENABLED && !Bukkit.isPrimaryThread()) {
-                        CoreProtect.getInstance().getServer().getPluginManager().callEvent(event);
-                    }
-
-                    if (event.isCancelled()) {
-                        return;
-                    }
-                    
                     int userId = UserStatement.getId(preparedStmt, event.getUser(), true);
                     Location eventLocation = event.getLocation();
                     int wid = WorldUtils.getWorldId(eventLocation.getWorld().getName());

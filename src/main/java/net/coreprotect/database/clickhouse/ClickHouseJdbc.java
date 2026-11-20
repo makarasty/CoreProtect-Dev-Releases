@@ -15,16 +15,28 @@ public final class ClickHouseJdbc implements AutoCloseable {
 
     private static final Set<String> DDL_OPERATIONS = Set.of("ALTER", "CREATE", "DROP", "RENAME", "TRUNCATE");
 
+    private final ClickHouseJdbcConfig config;
     private final HikariDataSource dataSource;
     private final HikariDataSource auxiliaryDataSource;
 
     public ClickHouseJdbc(ClickHouseJdbcConfig config) {
-        Objects.requireNonNull(config, "config");
+        this.config = Objects.requireNonNull(config, "config");
         dataSource = pool(config, "CoreProtect-ClickHouse", 10);
-        auxiliaryDataSource = pool(config, "CoreProtect-ClickHouse-Identity", 4);
+        try {
+            auxiliaryDataSource = pool(config, "CoreProtect-ClickHouse-Identity", 4);
+        }
+        catch (RuntimeException | Error failure) {
+            try {
+                dataSource.close();
+            }
+            catch (RuntimeException | Error closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
     }
 
-    private static HikariDataSource pool(ClickHouseJdbcConfig config, String name, int maximumPoolSize) {
+    static HikariDataSource pool(ClickHouseJdbcConfig config, String name, int maximumPoolSize) {
         HikariConfig pool = new HikariConfig();
         pool.setDataSource(new HikariClickHouseDataSource(config));
         pool.setPoolName(name);
@@ -32,6 +44,8 @@ public final class ClickHouseJdbc implements AutoCloseable {
         pool.setMaximumPoolSize(maximumPoolSize);
         pool.setConnectionTimeout(10_000L);
         pool.setIdleTimeout(60_000L);
+        pool.setMaxLifetime(120_000L);
+        pool.setKeepaliveTime(30_000L);
         pool.setInitializationFailTimeout(-1L);
         return new HikariDataSource(pool);
     }
@@ -43,6 +57,10 @@ public final class ClickHouseJdbc implements AutoCloseable {
     public static Connection openPatchConnection(ClickHouseJdbcConfig config) throws SQLException {
         ClickHouseJdbcConfig patch = config.forPatches();
         return new DataSourceImpl(patch.getJdbcUrl(), patch.getProperties()).getConnection();
+    }
+
+    Connection openMaintenanceConnection() throws SQLException {
+        return openPatchConnection(config);
     }
 
     Connection openAuxiliaryConnection() throws SQLException {

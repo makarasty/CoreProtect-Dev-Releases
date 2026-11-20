@@ -3,6 +3,8 @@ package net.coreprotect.database.clickhouse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLDataException;
+import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -42,16 +44,18 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
     private final Map<String, Integer> userAliases = new HashMap<>();
     private final Set<String> usernameHistory = new HashSet<>();
     private final EnumMap<ReferenceKind, Map<Integer, String>> localReferences = new EnumMap<>(ReferenceKind.class);
-    private final EnumMap<ReferenceKind, Map<Integer, String>> unpublishedReferences = new EnumMap<>(ReferenceKind.class);
     private ClickHouseWriteBatch batch;
     private boolean closed;
+    private boolean commitAttempted;
+    private boolean commitDefinitelyRejected;
+    private boolean ownsConsumerTransaction;
 
     public ClickHouseConsumerWriteBatch(ClickHouseDatabase database, String prefix) {
         this.database = Objects.requireNonNull(database, "database");
-        String validatedPrefix = prefix == null || prefix.isEmpty() ? "" : ClickHouseIdentifiers.requireIdentifier(prefix, "ClickHouse table prefix");
-        userTable = validatedPrefix + ClickHouseFamily.USER.getTableName();
-        usernameLogTable = validatedPrefix + ClickHouseFamily.USERNAME_LOG.getTableName();
-        entitySpawnUpdates = new ClickHouseEntitySpawnUpdates(this, validatedPrefix + "event_data");
+        String validatedPrefix = ClickHouseIdentifiers.requirePrefix(prefix);
+        userTable = ClickHouseIdentifiers.quote(validatedPrefix + ClickHouseFamily.USER.getTableName(), "ClickHouse table");
+        usernameLogTable = ClickHouseIdentifiers.quote(validatedPrefix + ClickHouseFamily.USERNAME_LOG.getTableName(), "ClickHouse table");
+        entitySpawnUpdates = new ClickHouseEntitySpawnUpdates(this, ClickHouseIdentifiers.quote(validatedPrefix + "event_data", "ClickHouse table"));
     }
 
     @Override
@@ -60,10 +64,15 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
         if (batch != null) {
             throw new IllegalStateException("ClickHouse consumer batch is already active");
         }
+        commitAttempted = false;
+        commitDefinitelyRejected = false;
         batch = database.newWriteBatch();
         clearBatchState();
         entitySpawnUpdates.beginBatch();
-        Consumer.transacting = true;
+        ownsConsumerTransaction = Consumer.isConsumerThread() && !Consumer.transacting;
+        if (ownsConsumerTransaction) {
+            Consumer.transacting = true;
+        }
     }
 
     @Override
@@ -74,6 +83,8 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
             database.publish(current);
             published = true;
             try {
+                localReferences.forEach((kind, references) ->
+                        references.forEach((id, value) -> ConfigHandler.cachePublishedIdentifier(kind, id, value)));
                 publishUserCaches();
             }
             finally {
@@ -86,16 +97,26 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
             return published;
         }
         finally {
+            commitAttempted = current.wasPublicationAttempted();
+            commitDefinitelyRejected = current.wasPublicationDefinitelyRejected();
             current.close();
             batch = null;
             if (!published) {
-                discardReferenceCache(Collections.emptyMap());
                 entitySpawnUpdates.batchDiscarded();
             }
             clearBatchState();
-            Consumer.transacting = false;
-            Consumer.interrupt = false;
+            releaseConsumerTransaction();
         }
+    }
+
+    @Override
+    public boolean wasCommitAttempted() {
+        return commitAttempted;
+    }
+
+    @Override
+    public boolean wasCommitDefinitelyRejected() {
+        return commitDefinitelyRejected;
     }
 
     @Override
@@ -110,11 +131,17 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
         }
         batch.close();
         batch = null;
-        discardReferenceCache(Collections.emptyMap());
         clearBatchState();
         entitySpawnUpdates.batchDiscarded();
-        Consumer.transacting = false;
-        Consumer.interrupt = false;
+        releaseConsumerTransaction();
+    }
+
+    private void releaseConsumerTransaction() {
+        if (ownsConsumerTransaction) {
+            ownsConsumerTransaction = false;
+            Consumer.transacting = false;
+            Consumer.interrupt = false;
+        }
     }
 
     @Override
@@ -239,34 +266,8 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
             return;
         }
 
-        Map<Integer, String> unpublished = unpublishedReferences.computeIfAbsent(kind, ignored -> new HashMap<>());
-        unpublished.put(id, requiredValue);
+        events().addReference(kind, id, requiredValue);
         references.put(id, requiredValue);
-        try {
-            switch (kind) {
-                case ART:
-                    events().addArtMap(id, requiredValue);
-                    break;
-                case BLOCK_DATA:
-                    events().addBlockDataMap(id, requiredValue);
-                    break;
-                case ENTITY:
-                    events().addEntityMap(id, requiredValue);
-                    break;
-                case MATERIAL:
-                    events().addMaterialMap(id, requiredValue);
-                    break;
-                case WORLD:
-                    events().addWorld(id, requiredValue);
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unsupported ClickHouse reference kind: " + kind);
-            }
-        }
-        catch (Exception exception) {
-            references.remove(id, requiredValue);
-            throw exception;
-        }
     }
 
     @Override
@@ -376,39 +377,12 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
             }
         }
         if (!remote.isEmpty()) {
-            resolved.putAll(database.resolveEventPointers(family, remote));
+            resolved.putAll(database.resolveAvailableEventPointers(family, remote));
         }
         for (Long rowId : unique) {
             ClickHouseEventPointer pointer = resolved.get(rowId);
-            if (pointer == null) {
-                throw new SQLException("Unable to resolve ClickHouse " + family.getTableName() + " row ID " + rowId);
-            }
-            requireBatch().addRollback(pointer, rolledBack);
-        }
-    }
-
-    @Override
-    public void updateRolledBackRows(int target, int rolledBack, List<Object[]> rows) throws Exception {
-        Objects.requireNonNull(rows, "rows");
-        ClickHouseFamily family = rollbackFamily(target);
-        if (family == ClickHouseFamily.ENTITY_CONTAINER) {
-            ConsumerWriteBatch.super.updateRolledBackRows(target, rolledBack, rows);
-            return;
-        }
-        ClickHouseWriteBatch current = requireBatch();
-        Set<Long> unique = new LinkedHashSet<>();
-        for (Object[] row : rows) {
-            if (row == null || row.length <= 10
-                    || !(row[0] instanceof Long)
-                    || !(row[1] instanceof Integer)
-                    || !(row[3] instanceof Integer)
-                    || !(row[5] instanceof Integer)
-                    || !(row[10] instanceof Integer)) {
-                throw new IllegalArgumentException("ClickHouse rollback rows are missing required event coordinates");
-            }
-            long rowId = (Long) row[0];
-            if (unique.add(rowId)) {
-                current.addRollback(family, rowId, (Integer) row[1], (Integer) row[10], (Integer) row[3], (Integer) row[5], rolledBack);
+            if (pointer != null) {
+                requireBatch().addRollback(pointer, rolledBack);
             }
         }
     }
@@ -607,7 +581,7 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
     }
 
     private static SQLException referenceConflict(ReferenceKind kind, int id, String value, int storedId, String storedValue) {
-        return new SQLException("ClickHouse " + kind.name().toLowerCase(Locale.ROOT) + " reference " + id + "='" + value + "' conflicts with " + storedId + "='" + storedValue + "'");
+        return new SQLIntegrityConstraintViolationException("ClickHouse " + kind.name().toLowerCase(Locale.ROOT) + " reference " + id + "='" + value + "' conflicts with " + storedId + "='" + storedValue + "'");
     }
 
     private void stageUser(String user, UserRow row) {
@@ -651,11 +625,10 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
             pointers.put(entry.getKey(), new LinkedHashMap<>(entry.getValue()));
         }
         return new AdapterCheckpoint(pointers, localBlockActions, usersByName, usersByUuid, userAliases,
-                usernameHistory, localReferences, unpublishedReferences);
+                usernameHistory, localReferences);
     }
 
     private void restore(AdapterCheckpoint checkpoint) {
-        discardReferenceCache(checkpoint.unpublishedReferences);
         localPointers.clear();
         for (Map.Entry<ClickHouseFamily, Map<Long, ClickHouseEventPointer>> entry : checkpoint.localPointers.entrySet()) {
             localPointers.put(entry.getKey(), new LinkedHashMap<>(entry.getValue()));
@@ -672,19 +645,6 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
         usernameHistory.addAll(checkpoint.usernameHistory);
         localReferences.clear();
         checkpoint.localReferences.forEach((kind, references) -> localReferences.put(kind, new HashMap<>(references)));
-        unpublishedReferences.clear();
-        checkpoint.unpublishedReferences.forEach((kind, references) -> unpublishedReferences.put(kind, new HashMap<>(references)));
-    }
-
-    private void discardReferenceCache(Map<ReferenceKind, Map<Integer, String>> retainedReferences) {
-        unpublishedReferences.forEach((kind, references) -> {
-            Map<Integer, String> retained = retainedReferences.get(kind);
-            references.forEach((id, value) -> {
-                if (retained == null || !value.equals(retained.get(id))) {
-                    ConfigHandler.uncacheIdentifier(kind, id, value);
-                }
-            });
-        });
     }
 
     private void clearBatchState() {
@@ -695,7 +655,6 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
         userAliases.clear();
         usernameHistory.clear();
         localReferences.clear();
-        unpublishedReferences.clear();
     }
 
     private void ensureOpen() {
@@ -734,7 +693,7 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
 
     private static int toIntId(long rowId, String family) throws SQLException {
         if (rowId > Integer.MAX_VALUE) {
-            throw new SQLException("ClickHouse " + family + " row IDs exceed CoreProtect's signed integer compatibility range");
+            throw new SQLDataException("ClickHouse " + family + " row IDs exceed CoreProtect's signed integer compatibility range");
         }
         return (int) rowId;
     }
@@ -802,13 +761,11 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
         private final Map<String, Integer> userAliases;
         private final Set<String> usernameHistory;
         private final EnumMap<ReferenceKind, Map<Integer, String>> localReferences = new EnumMap<>(ReferenceKind.class);
-        private final EnumMap<ReferenceKind, Map<Integer, String>> unpublishedReferences = new EnumMap<>(ReferenceKind.class);
 
         private AdapterCheckpoint(EnumMap<ClickHouseFamily, Map<Long, ClickHouseEventPointer>> localPointers, Map<Long, Integer> localBlockActions,
                 Map<String, UserRow> usersByName, Map<String, UserRow> usersByUuid,
                 Map<String, Integer> userAliases, Set<String> usernameHistory,
-                EnumMap<ReferenceKind, Map<Integer, String>> localReferences,
-                EnumMap<ReferenceKind, Map<Integer, String>> unpublishedReferences) {
+                EnumMap<ReferenceKind, Map<Integer, String>> localReferences) {
             this.localPointers = localPointers;
             this.localBlockActions = new HashMap<>(localBlockActions);
             this.usersByName = new HashMap<>(usersByName);
@@ -816,7 +773,6 @@ public final class ClickHouseConsumerWriteBatch implements ConsumerWriteBatch {
             this.userAliases = new HashMap<>(userAliases);
             this.usernameHistory = new HashSet<>(usernameHistory);
             localReferences.forEach((kind, references) -> this.localReferences.put(kind, new HashMap<>(references)));
-            unpublishedReferences.forEach((kind, references) -> this.unpublishedReferences.put(kind, new HashMap<>(references)));
         }
     }
 

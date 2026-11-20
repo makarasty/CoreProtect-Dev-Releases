@@ -1,9 +1,12 @@
 package net.coreprotect.listener.player;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import org.bukkit.inventory.ItemStack;
+
+import net.coreprotect.utility.ItemUtils;
 
 final class HopperPullAccumulator {
 
@@ -55,61 +58,32 @@ final class HopperPullAccumulator {
             for (long repetition = 0; repetition < run.repetitions; repetition++) {
                 ItemStack movedItem = run.item.clone();
                 movedItem.setAmount(run.amount);
-                consumer.accept(run.user, state, movedItem);
-                state = removeFromState(state, movedItem);
+                ItemStack[] after = removeFromState(state, movedItem);
+                consumer.accept(run.user, state, after);
+                state = after;
             }
         }
     }
 
     private static ItemStack[] addToState(ItemStack[] state, ItemStack item, long amount, int inventoryMaxStackSize) {
         ItemStack[] result = state.clone();
-        long remaining = amount;
-        int maxStackSize = maxStackSize(item, inventoryMaxStackSize);
-
-        for (int i = 0; i < result.length && remaining > 0; i++) {
-            ItemStack existing = result[i];
-            if (existing == null || existing.getAmount() <= 0 || !existing.isSimilar(item) || existing.getAmount() >= maxStackSize) {
-                continue;
-            }
-
-            int added = (int) Math.min(remaining, maxStackSize - existing.getAmount());
-            ItemStack updated = existing.clone();
-            updated.setAmount(existing.getAmount() + added);
-            result[i] = updated;
-            remaining -= added;
-        }
-
-        for (int i = 0; i < result.length && remaining > 0; i++) {
-            ItemStack existing = result[i];
-            if (existing != null && existing.getAmount() > 0) {
-                continue;
-            }
-
-            int added = (int) Math.min(remaining, maxStackSize);
-            ItemStack inserted = item.clone();
-            inserted.setAmount(added);
-            result[i] = inserted;
-            remaining -= added;
-        }
-
+        long remaining = ItemUtils.insertIntoContainerSnapshot(result, item, amount, inventoryMaxStackSize);
         if (remaining <= 0) {
             return result;
         }
 
-        long additionalSlots = (remaining + maxStackSize - 1L) / maxStackSize;
+        int maxStackSize = ItemUtils.getContainerStackLimit(item, inventoryMaxStackSize);
+        long additionalSlots = 1 + (remaining - 1) / maxStackSize;
         if (additionalSlots > Integer.MAX_VALUE - result.length) {
             throw new IllegalStateException("Hopper pull reconstruction exceeds maximum inventory size");
         }
 
-        ItemStack[] expanded = new ItemStack[result.length + (int) additionalSlots];
-        System.arraycopy(result, 0, expanded, 0, result.length);
-        int slot = result.length;
-        while (remaining > 0) {
+        ItemStack[] expanded = Arrays.copyOf(result, result.length + (int) additionalSlots, ItemStack[].class);
+        for (int slot = result.length; slot < expanded.length; slot++) {
             int added = (int) Math.min(remaining, maxStackSize);
             ItemStack inserted = item.clone();
             inserted.setAmount(added);
             expanded[slot] = inserted;
-            slot++;
             remaining -= added;
         }
         return expanded;
@@ -138,17 +112,9 @@ final class HopperPullAccumulator {
         return result;
     }
 
-    private static int maxStackSize(ItemStack item, int inventoryMaxStackSize) {
-        int maxStackSize = item.getMaxStackSize();
-        if (inventoryMaxStackSize > 0 && (inventoryMaxStackSize < maxStackSize || maxStackSize < 1)) {
-            maxStackSize = inventoryMaxStackSize;
-        }
-        return Math.max(1, maxStackSize);
-    }
-
     @FunctionalInterface
     interface MoveConsumer {
-        void accept(String user, ItemStack[] sourceBefore, ItemStack movedItem);
+        void accept(String user, ItemStack[] sourceBefore, ItemStack[] sourceAfter);
     }
 
     private static final class MoveRun {

@@ -7,8 +7,10 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -17,6 +19,8 @@ import org.duckdb.DuckDBConnection;
 
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.statement.EntitySpawnStatement;
+import net.coreprotect.database.statement.UserStatement;
+import net.coreprotect.database.statement.UserStatement.Identity;
 import net.coreprotect.utility.StringUtils;
 
 public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
@@ -35,6 +39,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     private static final int ENTITY_MAP_BATCH = 13;
     private static final int BLOCK_DATA_BATCH = 14;
     private static final int ENTITY_KILL_LINK_BATCH = 15;
+    private static final int BATCH_SIZE = 1000;
     private static final int INITIAL_DUCKDB_BLOCK_ID_RESERVATION = 256;
     private static final int MAXIMUM_DUCKDB_BLOCK_ID_RESERVATION = 65536;
     private static final long[] EMPTY_ROW_IDS = new long[0];
@@ -43,7 +48,10 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     private final DatabaseType databaseType;
     private final Statement transactionStatement;
     private final PreparedStatement[] batchStatements = new PreparedStatement[16];
+    private final int[] pendingBatchCounts = new int[batchStatements.length];
     private final List<PreparedStatement> statements = new ArrayList<>();
+    private final Map<String, Identity> pendingUsersByName = new HashMap<>();
+    private final List<UserCacheUpdate> userCacheUpdates = new ArrayList<>();
 
     private PreparedStatement blockReturningStatement;
     private PreparedStatement skullStatement;
@@ -53,11 +61,6 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     private PreparedStatement entitySpawnCheckpointStatement;
     private PreparedStatement entitySpawnCheckpointStateStatement;
     private PreparedStatement entityInteractionStatement;
-    private PreparedStatement userByNameStatement;
-    private PreparedStatement userByNameOrUuidStatement;
-    private PreparedStatement userInsertStatement;
-    private PreparedStatement usernameByUuidStatement;
-    private PreparedStatement usernameUpdateStatement;
     private PreparedStatement usernameHistoryStatement;
     private PreparedStatement usernameHistoryInsertStatement;
     private PreparedStatement databaseLockStatement;
@@ -68,6 +71,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     private int duckDBBlockIdReservationSize = INITIAL_DUCKDB_BLOCK_ID_RESERVATION;
     private DuckDBSpatialIndex.Transaction duckDBSpatialIndex;
     private EntitySpawnStatement.Updates entitySpawnUpdates;
+    private SQLException batchFailure;
     private boolean commitAttempted;
     private Throwable commitFailure;
 
@@ -92,22 +96,25 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         clearProcessedEntityRemovals();
         commitAttempted = false;
         commitFailure = null;
+        boolean writesCommitted = false;
         try {
             finishDuckDBBlockAppender();
+            if (batchFailure != null) {
+                throw batchFailure;
+            }
             boolean acknowledgedRollback = Database.isRollbackOnlyTransactionAcknowledged();
             if (!Database.isTransactionRollbackOnly()) {
-                for (PreparedStatement statement : batchStatements) {
-                    if (statement != null) {
-                        statement.executeBatch();
-                    }
+                for (int index = 0; index < batchStatements.length; index++) {
+                    flushPendingBatch(index);
                 }
                 if (duckDBSpatialIndex != null) {
                     duckDBSpatialIndex.flush(connection);
                 }
             }
+            boolean rollbackOnly = Database.isTransactionRollbackOnly();
             boolean committed = Database.commitTransactionChecked(transactionStatement, databaseType, () -> commitAttempted = true);
             if (!committed) {
-                boolean rolledBack = Database.rollbackTransaction(transactionStatement, databaseType);
+                boolean rolledBack = !rollbackOnly && Database.rollbackTransaction(transactionStatement, databaseType);
                 if (commitAttempted || !rolledBack) {
                     abandonDuckDBSpatialIndex();
                 }
@@ -120,6 +127,8 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
                 duckDBSpatialIndex = null;
                 return true;
             }
+            writesCommitted = true;
+            publishUserCacheUpdates();
             if (duckDBSpatialIndex != null) {
                 duckDBSpatialIndex.publish();
                 duckDBSpatialIndex = null;
@@ -138,6 +147,12 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
             }
             return false;
         }
+        finally {
+            clearUserCacheUpdates();
+            if (!writesCommitted) {
+                clearPendingBatches();
+            }
+        }
     }
 
     @Override
@@ -154,17 +169,22 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     public void rollback() {
         clearProcessedEntityRemovals();
         try {
-            finishDuckDBBlockAppender();
+            try {
+                finishDuckDBBlockAppender();
+            }
+            catch (Exception exception) {
+                Database.reportDatabaseFailure(exception);
+            }
+            if (Database.rollbackTransaction(transactionStatement, databaseType)) {
+                duckDBSpatialIndex = null;
+            }
+            else {
+                abandonDuckDBSpatialIndex();
+            }
         }
-        catch (Exception exception) {
-            Database.reportDatabaseFailure(exception);
-        }
-        boolean rolledBack = Database.rollbackTransaction(transactionStatement, databaseType);
-        if (!rolledBack) {
-            abandonDuckDBSpatialIndex();
-        }
-        else {
-            duckDBSpatialIndex = null;
+        finally {
+            clearUserCacheUpdates();
+            clearPendingBatches();
         }
     }
 
@@ -177,98 +197,124 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
 
     @Override
     public void executeAtomically(String name, Database.SavepointOperation operation) throws Exception {
-        Database.executeSavepoint(transactionStatement, name, operation);
+        int previousUpdateCount = userCacheUpdates.size();
+        try {
+            Database.executeSavepoint(transactionStatement, name, operation);
+        }
+        catch (Exception exception) {
+            if (previousUpdateCount != userCacheUpdates.size()) {
+                userCacheUpdates.subList(previousUpdateCount, userCacheUpdates.size()).clear();
+                pendingUsersByName.clear();
+                userCacheUpdates.forEach(this::applyUserCacheUpdate);
+            }
+            throw exception;
+        }
     }
 
     @Override
     public int resolveUserId(String user, String uuid) throws Exception {
         user = StringUtils.normalizeUsername(user);
-        String cacheKey = user.toLowerCase(Locale.ROOT);
-        Integer cachedId = ConfigHandler.playerIdCache.get(cacheKey);
-        if (cachedId != null) {
-            return cachedId;
-        }
-
-        PreparedStatement statement = uuid == null ? userByNameStatement() : userByNameOrUuidStatement();
-        statement.setString(1, user);
-        if (uuid != null) {
-            statement.setString(2, uuid);
-        }
-
-        int userId = -1;
-        String storedUuid = uuid;
-        try (ResultSet resultSet = statement.executeQuery()) {
-            if (resultSet.next()) {
-                userId = resultSet.getInt(1);
-                storedUuid = resultSet.getString(2);
+        uuid = UserStatement.normalizeUuid(uuid);
+        if (uuid == null) {
+            String cacheKey = user.toLowerCase(Locale.ROOT);
+            Identity pending = pendingUsersByName.get(cacheKey);
+            if (pending != null) {
+                return pending.getId();
+            }
+            if (!pendingUsersByName.containsKey(cacheKey)) {
+                Integer cachedId = ConfigHandler.playerIdCache.get(cacheKey);
+                if (cachedId != null && cachedId > 0) {
+                    return cachedId;
+                }
             }
         }
-        if (userId == -1) {
-            userId = insertUser(user);
-        }
 
-        ConfigHandler.playerIdCache.put(cacheKey, userId);
-        ConfigHandler.playerIdCacheReversed.put(userId, user);
-        if (storedUuid != null) {
-            ConfigHandler.uuidCache.put(cacheKey, storedUuid);
-            ConfigHandler.uuidCacheReversed.put(storedUuid, user);
+        Identity identity = UserStatement.findIdentity(connection, user, uuid);
+        if (identity == null || (uuid != null && identity.getUuid() == null)) {
+            identity = UserStatement.storeIdentity(connection, identity, user, uuid, (int) (System.currentTimeMillis() / 1000L));
+            stageUserCacheUpdate(null, identity);
         }
-        return userId;
+        else if (uuid == null) {
+            stageUserCacheUpdate(null, identity);
+        }
+        return identity.getId();
     }
 
     @Override
-    public void recordUsername(String user, String uuid, int retainHistory, int time) throws Exception {
-        user = StringUtils.normalizeUsername(user);
-        if (ConfigHandler.isBlacklisted(user)) {
+    public void recordUsername(String suppliedUser, String suppliedUuid, int retainHistory, int time) throws Exception {
+        String user = StringUtils.normalizeUsername(suppliedUser);
+        String uuid = UserStatement.normalizeUuid(suppliedUuid);
+        if (user == null || user.isEmpty() || uuid == null || ConfigHandler.isBlacklisted(user)) {
             return;
         }
 
-        PreparedStatement lookup = usernameByUuidStatement();
-        lookup.setString(1, uuid);
-        int userId = -1;
-        String storedUser = null;
-        try (ResultSet resultSet = lookup.executeQuery()) {
-            if (resultSet.next()) {
-                userId = resultSet.getInt(1);
-                storedUser = resultSet.getString(2);
+        executeAtomically("username_history", () -> {
+            Identity previous = UserStatement.findIdentity(connection, user, uuid);
+            boolean changed = previous == null || previous.getUuid() == null || !user.equalsIgnoreCase(previous.getName());
+            Identity identity = changed ? UserStatement.storeIdentity(connection, previous, user, uuid, time) : previous;
+            if (retainHistory == 1 && (changed || !hasUsernameHistory(user, uuid))) {
+                PreparedStatement statement = usernameHistoryInsertStatement();
+                statement.setInt(1, time);
+                statement.setString(2, uuid);
+                statement.setString(3, user);
+                statement.executeUpdate();
+            }
+            stageUserCacheUpdate(previous, identity);
+        });
+    }
+
+    private boolean hasUsernameHistory(String user, String uuid) throws SQLException {
+        PreparedStatement statement = usernameHistoryStatement();
+        statement.setString(1, uuid);
+        statement.setString(2, user);
+        try (ResultSet rows = statement.executeQuery()) {
+            return rows.next();
+        }
+    }
+
+    private void stageUserCacheUpdate(Identity previous, Identity current) {
+        UserCacheUpdate update = new UserCacheUpdate(previous, current);
+        userCacheUpdates.add(update);
+        applyUserCacheUpdate(update);
+    }
+
+    private void applyUserCacheUpdate(UserCacheUpdate update) {
+        String key = update.current.getName().toLowerCase(Locale.ROOT);
+        if (update.previous != null) {
+            String previousKey = update.previous.getName().toLowerCase(Locale.ROOT);
+            Identity pending = pendingUsersByName.get(previousKey);
+            if (!key.equals(previousKey) && (pending == null || pending.getId() == update.previous.getId())) {
+                pendingUsersByName.put(previousKey, null);
             }
         }
+        pendingUsersByName.put(key, update.current);
+    }
 
-        boolean update = storedUser == null || !user.equalsIgnoreCase(storedUser);
-        if (storedUser == null) {
-            Integer cachedId = ConfigHandler.playerIdCache.get(user.toLowerCase(Locale.ROOT));
-            userId = cachedId == null ? resolveUserId(user, uuid) : cachedId;
+    private void publishUserCacheUpdates() {
+        for (UserCacheUpdate update : userCacheUpdates) {
+            UserStatement.evictPreviousName(update.previous, update.current);
         }
-
-        if (update) {
-            PreparedStatement statement = usernameUpdateStatement();
-            statement.setString(1, user);
-            statement.setString(2, uuid);
-            statement.setInt(3, userId);
-            statement.executeUpdate();
-        }
-        else {
-            PreparedStatement statement = usernameHistoryStatement();
-            statement.setString(1, uuid);
-            statement.setString(2, user);
-            try (ResultSet resultSet = statement.executeQuery()) {
-                update = !resultSet.next();
+        for (Identity identity : pendingUsersByName.values()) {
+            if (identity != null) {
+                UserStatement.publishIdentity(identity);
             }
         }
+    }
 
-        if (update && retainHistory == 1) {
-            PreparedStatement statement = usernameHistoryInsertStatement();
-            statement.setInt(1, time);
-            statement.setString(2, uuid);
-            statement.setString(3, user);
-            statement.executeUpdate();
+    private void clearUserCacheUpdates() {
+        userCacheUpdates.clear();
+        pendingUsersByName.clear();
+    }
+
+    private static final class UserCacheUpdate {
+
+        private final Identity previous;
+        private final Identity current;
+
+        private UserCacheUpdate(Identity previous, Identity current) {
+            this.previous = previous;
+            this.current = current;
         }
-
-        String cacheKey = user.toLowerCase(Locale.ROOT);
-        ConfigHandler.playerIdCache.put(cacheKey, userId);
-        ConfigHandler.playerIdCacheReversed.put(userId, user);
-        ConfigHandler.uuidCache.put(cacheKey, uuid);
-        ConfigHandler.uuidCacheReversed.put(uuid, user);
     }
 
     @Override
@@ -281,29 +327,32 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
 
     @Override
     public void addReference(ReferenceKind kind, int batchCount, int id, String value) throws Exception {
-        PreparedStatement statement;
         switch (kind) {
             case ART:
-                statement = batchStatement(Database.ART, ART_BATCH);
+                addReference(Database.ART, ART_BATCH, id, value);
                 break;
             case BLOCK_DATA:
-                statement = batchStatement(Database.BLOCKDATA, BLOCK_DATA_BATCH);
+                addReference(Database.BLOCKDATA, BLOCK_DATA_BATCH, id, value);
                 break;
             case ENTITY:
-                statement = batchStatement(Database.ENTITY_MAP, ENTITY_MAP_BATCH);
+                addReference(Database.ENTITY_MAP, ENTITY_MAP_BATCH, id, value);
                 break;
             case MATERIAL:
-                statement = batchStatement(Database.MATERIAL, MATERIAL_BATCH);
+                addReference(Database.MATERIAL, MATERIAL_BATCH, id, value);
                 break;
             case WORLD:
-                statement = batchStatement(Database.WORLD, WORLD_BATCH);
+                addReference(Database.WORLD, WORLD_BATCH, id, value);
                 break;
             default:
                 throw new IllegalArgumentException("Unsupported reference kind " + kind);
         }
+    }
+
+    private void addReference(int type, int index, int id, String value) throws SQLException {
+        PreparedStatement statement = batchStatement(type, index);
         statement.setInt(1, id);
         statement.setString(2, value);
-        addBatch(statement, batchCount);
+        addBatch(index);
     }
 
     @Override
@@ -314,7 +363,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         }
         PreparedStatement statement = batchStatement(Database.BLOCK, BLOCK_BATCH);
         setBlock(statement, time, userId, worldId, x, y, z, type, data, meta, blockData, action, rolledBack);
-        addBatch(statement, batchCount);
+        addBatch(BLOCK_BATCH);
     }
 
     @Override
@@ -358,7 +407,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         statement.setObject(10, metadata);
         statement.setInt(11, action);
         statement.setInt(12, rolledBack);
-        addBatch(statement, batchCount);
+        addBatch(CONTAINER_BATCH);
         trackDuckDBGenerated("container", worldId, x, z);
     }
 
@@ -378,7 +427,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         statement.setObject(11, metadata);
         statement.setInt(12, action);
         statement.setInt(13, rolledBack);
-        addBatch(statement, batchCount);
+        addBatch(ENTITY_CONTAINER_BATCH);
         trackDuckDBGenerated("entity_container", worldId, x, z, entitySpawnRowId);
     }
 
@@ -396,7 +445,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         statement.setInt(9, amount);
         statement.setInt(10, action);
         statement.setInt(11, rolledBack);
-        addBatch(statement, batchCount);
+        addBatch(ITEM_BATCH);
         trackDuckDBGenerated("item", worldId, x, z);
     }
 
@@ -404,7 +453,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     public void addChat(int batchCount, long time, int userId, int worldId, int x, int y, int z, String message) throws Exception {
         PreparedStatement statement = batchStatement(Database.CHAT, CHAT_BATCH);
         setMessage(statement, time, userId, worldId, x, y, z, message);
-        addBatch(statement, batchCount);
+        addBatch(CHAT_BATCH);
         trackDuckDBGenerated("chat", worldId, x, z);
     }
 
@@ -412,7 +461,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
     public void addCommand(int batchCount, long time, int userId, int worldId, int x, int y, int z, String message) throws Exception {
         PreparedStatement statement = batchStatement(Database.COMMAND, COMMAND_BATCH);
         setMessage(statement, time, userId, worldId, x, y, z, message);
-        addBatch(statement, batchCount);
+        addBatch(COMMAND_BATCH);
         trackDuckDBGenerated("command", worldId, x, z);
     }
 
@@ -426,7 +475,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         statement.setInt(5, y);
         statement.setInt(6, z);
         statement.setInt(7, action);
-        addBatch(statement, batchCount);
+        addBatch(SESSION_BATCH);
         trackDuckDBGenerated("session", worldId, x, z);
     }
 
@@ -451,7 +500,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         for (int index = 0; index < lines.length; index++) {
             statement.setString(13 + index, lines[index]);
         }
-        addBatch(statement, batchCount);
+        addBatch(SIGN_BATCH);
         trackDuckDBGenerated("sign", worldId, x, z);
     }
 
@@ -521,7 +570,7 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         }
         statement.setInt(1, killRowId);
         statement.setString(2, uuid.toString());
-        statement.addBatch();
+        addBatch(ENTITY_KILL_LINK_BATCH);
     }
 
     @Override
@@ -672,36 +721,6 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         }
     }
 
-    private PreparedStatement userByNameStatement() throws SQLException {
-        if (userByNameStatement == null) {
-            String collate = databaseType.isMySQL() ? "" : " COLLATE NOCASE";
-            userByNameStatement = own(connection.prepareStatement("SELECT rowid,uuid FROM " + ConfigHandler.prefix + "user WHERE " + databaseType.getUserColumn() + "=?" + collate + " ORDER BY rowid ASC LIMIT 1 OFFSET 0"));
-        }
-        return userByNameStatement;
-    }
-
-    private PreparedStatement userByNameOrUuidStatement() throws SQLException {
-        if (userByNameOrUuidStatement == null) {
-            String collate = databaseType.isMySQL() ? "" : " COLLATE NOCASE";
-            userByNameOrUuidStatement = own(connection.prepareStatement("SELECT rowid,uuid FROM " + ConfigHandler.prefix + "user WHERE " + databaseType.getUserColumn() + "=?" + collate + " OR uuid=? ORDER BY rowid ASC LIMIT 1 OFFSET 0"));
-        }
-        return userByNameOrUuidStatement;
-    }
-
-    private PreparedStatement usernameByUuidStatement() throws SQLException {
-        if (usernameByUuidStatement == null) {
-            usernameByUuidStatement = own(connection.prepareStatement("SELECT rowid," + databaseType.getUserColumn() + " FROM " + ConfigHandler.prefix + "user WHERE uuid=? LIMIT 1 OFFSET 0"));
-        }
-        return usernameByUuidStatement;
-    }
-
-    private PreparedStatement usernameUpdateStatement() throws SQLException {
-        if (usernameUpdateStatement == null) {
-            usernameUpdateStatement = own(connection.prepareStatement("UPDATE " + ConfigHandler.prefix + "user SET " + databaseType.getUserColumn() + "=?,uuid=? WHERE rowid=?"));
-        }
-        return usernameUpdateStatement;
-    }
-
     private PreparedStatement usernameHistoryStatement() throws SQLException {
         if (usernameHistoryStatement == null) {
             usernameHistoryStatement = own(connection.prepareStatement("SELECT rowid FROM " + ConfigHandler.prefix + "username_log WHERE uuid=? AND " + databaseType.getUserColumn() + "=? LIMIT 1 OFFSET 0"));
@@ -849,17 +868,6 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         }
     }
 
-    private int insertUser(String user) throws Exception {
-        user = StringUtils.normalizeUsername(user);
-        if (userInsertStatement == null) {
-            String sql = "INSERT INTO " + ConfigHandler.prefix + "user (time," + databaseType.getUserColumn() + ") VALUES (?,?)";
-            userInsertStatement = own(prepare(sql, true));
-        }
-        userInsertStatement.setInt(1, (int) (System.currentTimeMillis() / 1000L));
-        userInsertStatement.setString(2, user);
-        return Math.toIntExact(executeReturningId(userInsertStatement, "user insert"));
-    }
-
     private PreparedStatement prepare(String sql, boolean keys) throws SQLException {
         if (!keys) {
             return connection.prepareStatement(sql);
@@ -882,10 +890,51 @@ public final class RelationalConsumerWriteBatch implements ConsumerWriteBatch {
         return statement;
     }
 
-    private static void addBatch(PreparedStatement statement, int batchCount) throws SQLException {
-        statement.addBatch();
-        if (batchCount > 0 && batchCount % 1000 == 0) {
-            statement.executeBatch();
+    private void addBatch(int index) throws SQLException {
+        if (batchFailure != null) {
+            throw batchFailure;
+        }
+        try {
+            batchStatements[index].addBatch();
+            if (++pendingBatchCounts[index] == BATCH_SIZE) {
+                flushPendingBatch(index);
+            }
+        }
+        catch (SQLException exception) {
+            batchFailure = exception;
+            throw exception;
+        }
+    }
+
+    private void flushPendingBatch(int index) throws SQLException {
+        if (pendingBatchCounts[index] > 0) {
+            batchStatements[index].executeBatch();
+            pendingBatchCounts[index] = 0;
+        }
+    }
+
+    private void clearPendingBatches() {
+        batchFailure = null;
+        for (int index = 0; index < batchStatements.length; index++) {
+            pendingBatchCounts[index] = 0;
+            PreparedStatement statement = batchStatements[index];
+            if (statement == null) {
+                continue;
+            }
+            try {
+                statement.clearBatch();
+            }
+            catch (SQLException exception) {
+                batchStatements[index] = null;
+                try {
+                    statement.close();
+                    statements.remove(statement);
+                }
+                catch (SQLException closeException) {
+                    exception.addSuppressed(closeException);
+                }
+                Database.reportDatabaseFailure(exception);
+            }
         }
     }
 

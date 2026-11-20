@@ -22,7 +22,7 @@ public final class ClickHouseSchema {
     private static final String INTEGER_CODEC = " CODEC(Delta, ZSTD(3))";
     private static final String VALUE_CODEC = " CODEC(ZSTD(3))";
     private static final String SPARSE_SERIALIZATION_SETTING = "ratio_of_defaults_for_sparse_serialization=0.9";
-    private static final String PURGEABLE_FAMILIES = purgeableFamilies();
+    static final String PURGEABLE_FAMILIES = purgeableFamilies();
     private static final String EVENT_PARTITION_KEY = "if(family='" + BATCH_RECEIPT_FAMILY + "',wid,if(family IN (" + PURGEABLE_FAMILIES
             + "),toYYYYMM(toDateTime(time,'UTC')),0))";
     private static final String EVENT_SORTING_KEY = "(family,wid,x,z,if(family IN ('database_lock','user','version'),0,time),rowid,if(family='"
@@ -386,9 +386,9 @@ public final class ClickHouseSchema {
     public static String lookupTable(String prefix, String table, String keyPredicate) {
         String projection = rollbackProjection(table);
         if (projection == null) {
-            return prefix + table;
+            return ClickHouseIdentifiers.quote(ClickHouseIdentifiers.requirePrefix(prefix) + table, "ClickHouse table");
         }
-        String eventData = ClickHouseIdentifiers.quote(prefix + "event_data", "ClickHouse table");
+        String eventData = ClickHouseIdentifiers.quote(ClickHouseIdentifiers.requirePrefix(prefix) + "event_data", "ClickHouse table");
         return "(" + rollbackSelect(eventData, table, projection, keyPredicate) + ")";
     }
 
@@ -406,7 +406,7 @@ public final class ClickHouseSchema {
     public static String eventSource(String eventData, String table, String keyPredicate) {
         String prewhere = keyPredicate.isEmpty() ? "" : " PREWHERE " + keyPredicate.replace("_key_time", "time")
                 .replace("_key_wid", "wid").replace("_key_x", "x").replace("_key_z", "z");
-        return "SELECT * FROM " + eventData + " FINAL" + prewhere + " WHERE family='" + table + "'";
+        return "SELECT * FROM " + eventData + " FINAL" + prewhere + " WHERE family='" + table + "' AND action IS NOT NULL";
     }
 
     static String rollbackProjection(String table) {
@@ -437,7 +437,7 @@ public final class ClickHouseSchema {
                 + ",e.origin_x AS origin_x,e.origin_y AS origin_y,e.origin_z AS origin_z"
                 + ",e.current_x AS x,e.current_y AS y,e.current_z AS z"
                 + ",e.yaw AS yaw,e.pitch AS pitch," + binary("if(e.entity_data_present=1,e.entity_data,NULL)", "data") + ",e.removed AS removed" + locationKeys(ClickHouseFamily.ENTITY_SPAWN)
-                + " FROM " + currentEvents(names, ClickHouseFamily.ENTITY_SPAWN) + " AS e";
+                + " FROM " + currentEvents(names, ClickHouseFamily.ENTITY_SPAWN) + " AS e WHERE e.origin_x IS NOT NULL";
     }
 
     static String binary(String value, String alias) {
@@ -589,8 +589,8 @@ public final class ClickHouseSchema {
         private final String identityReservation;
 
         private Names(String database, String prefix) {
-            this.database = ClickHouseIdentifiers.quote(database, "ClickHouse database");
-            this.prefix = validatePrefix(prefix);
+            this.database = ClickHouseIdentifiers.requireIdentifier(database, "ClickHouse database");
+            this.prefix = ClickHouseIdentifiers.requirePrefix(prefix);
             eventData = table("event_data");
             retentionHighWater = table("retention_high_water");
             storageMetadata = table("storage_metadata");
@@ -598,18 +598,12 @@ public final class ClickHouseSchema {
         }
 
         private String table(String suffix) {
-            return database + "." + ClickHouseIdentifiers.quote(rawTable(suffix), "ClickHouse table");
+            return ClickHouseIdentifiers.qualified(database, rawTable(suffix));
         }
 
         private String rawTable(String suffix) {
             return prefix + suffix;
         }
 
-        private static String validatePrefix(String prefix) {
-            if (prefix == null) {
-                throw new IllegalArgumentException("ClickHouse table prefix cannot be null");
-            }
-            return prefix.isEmpty() ? prefix : ClickHouseIdentifiers.requireIdentifier(prefix, "ClickHouse table prefix");
-        }
     }
 }

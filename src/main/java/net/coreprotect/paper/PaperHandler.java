@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import org.bukkit.Location;
 import org.bukkit.Server;
@@ -12,6 +13,8 @@ import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockState;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Firework;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Villager;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
@@ -30,6 +33,12 @@ public class PaperHandler extends PaperAdapter {
     private volatile boolean supportsVillagerReputations = true;
     private volatile boolean supportsVillagerRestocks = true;
     private volatile boolean supportsTradeDiscounts = true;
+
+    @Override
+    public LivingEntity getFireworkRider(Firework firework) {
+        LivingEntity rider = super.getFireworkRider(firework);
+        return rider == null ? firework.getBoostedEntity() : rider;
+    }
 
     @Override
     public boolean isStopping(Server server) {
@@ -51,8 +60,8 @@ public class PaperHandler extends PaperAdapter {
     }
 
     @Override
-    public void teleportAsync(Entity entity, Location location) {
-        entity.teleportAsync(location);
+    public CompletableFuture<Boolean> teleportAsync(Entity entity, Location location) {
+        return entity.teleportAsync(location);
     }
 
     @Override

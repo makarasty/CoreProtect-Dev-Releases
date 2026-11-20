@@ -1,15 +1,12 @@
 package net.coreprotect.listener.entity;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.bukkit.Bukkit;
-import org.bukkit.Color;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.Registry;
@@ -19,10 +16,11 @@ import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.block.Block;
-import org.bukkit.entity.AbstractArrow;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.AbstractHorse;
 import org.bukkit.entity.AbstractVillager;
 import org.bukkit.entity.Ageable;
+import org.bukkit.entity.AnimalTamer;
 import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Bee;
 import org.bukkit.entity.Cat;
@@ -30,7 +28,6 @@ import org.bukkit.entity.ChestedHorse;
 import org.bukkit.entity.Creeper;
 import org.bukkit.entity.Enderman;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Fox;
 import org.bukkit.entity.Horse;
 import org.bukkit.entity.IronGolem;
@@ -49,7 +46,6 @@ import org.bukkit.entity.Skeleton;
 import org.bukkit.entity.Slime;
 import org.bukkit.entity.Spellcaster;
 import org.bukkit.entity.Tameable;
-import org.bukkit.entity.ThrownPotion;
 import org.bukkit.entity.TropicalFish;
 import org.bukkit.entity.Villager;
 import org.bukkit.entity.Wolf;
@@ -61,17 +57,11 @@ import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.MerchantRecipe;
-import org.bukkit.inventory.meta.ItemMeta;
-import org.bukkit.inventory.meta.LeatherArmorMeta;
-import org.bukkit.projectiles.ProjectileSource;
-
-import com.google.common.collect.Lists;
 
 import net.coreprotect.CoreProtect;
 import net.coreprotect.bukkit.BukkitAdapter;
@@ -85,11 +75,13 @@ import net.coreprotect.thread.CacheHandler;
 import net.coreprotect.thread.Scheduler;
 import net.coreprotect.utility.AttributeUtils;
 import net.coreprotect.utility.EntitySpawnTracking;
+import net.coreprotect.utility.EntityUtils;
 import net.coreprotect.utility.entity.EntityUtil;
 import net.coreprotect.utility.entity.LivingEntityDetails;
+import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.serialize.ItemMetaHandler;
 
-public final class EntityDeathListener extends Queue implements Listener {
+public final class EntityDeathListener implements Listener {
 
     private static final int ENTITY_KILL_DUPLICATE_THRESHOLD = 256;
     private static final int ENTITY_KILL_DUPLICATE_WINDOW_SECONDS = 900;
@@ -100,12 +92,24 @@ public final class EntityDeathListener extends Queue implements Listener {
         MemoryKey.MEETING_POINT,
         MemoryKey.LAST_WORKED_AT_POI
     };
-    private static final Map<UUID, Object[]> pendingArmorStandBreaks = new ConcurrentHashMap<>();
+    private static final Map<UUID, ArmorStandBreak> pendingArmorStandBreaks = new ConcurrentHashMap<>();
+
+    private static final class ArmorStandBreak {
+        private final EntityDamageEvent damage;
+        private final String user;
+        private final ItemStack[] contents;
+
+        private ArmorStandBreak(EntityDamageEvent damage, String user, ItemStack[] contents) {
+            this.damage = damage;
+            this.user = user;
+            this.contents = contents;
+        }
+    }
 
     // Armor stand contents can't be read on EntityDeathEvent (in survival mode), so the damage listeners capture them here
-    protected static void trackArmorStandBreak(Entity armorStand, String user, ItemStack[] contents) {
+    protected static void trackArmorStandBreak(Entity armorStand, EntityDamageEvent damage, String user, ItemStack[] contents) {
         UUID uuid = armorStand.getUniqueId();
-        Object[] pendingBreak = new Object[] { user, contents };
+        ArmorStandBreak pendingBreak = new ArmorStandBreak(damage, user, contents);
         pendingArmorStandBreaks.put(uuid, pendingBreak);
 
         // onEntityDeath logs the break if the hit was lethal. Otherwise, discard the capture on the next tick, or when Folia retires
@@ -114,212 +118,65 @@ public final class EntityDeathListener extends Queue implements Listener {
         Scheduler.scheduleSyncDelayedTask(CoreProtect.getInstance(), discard, discard, armorStand, 0);
     }
 
-    private static void logArmorStandBreak(ArmorStand armorStand) {
-        Object[] pendingBreak = pendingArmorStandBreaks.remove(armorStand.getUniqueId());
-        if (pendingBreak == null) {
+    private static void logArmorStandBreak(ArmorStand armorStand, String user, Config config) {
+        ArmorStandBreak pendingBreak = pendingArmorStandBreaks.remove(armorStand.getUniqueId());
+        if (!config.BLOCK_BREAK) {
             return;
         }
 
-        String user = (String) pendingBreak[0];
-        ItemStack[] contents = (ItemStack[]) pendingBreak[1];
+        EntityDamageEvent damage = user == null ? armorStand.getLastDamageCause() : null;
+        boolean captured = pendingBreak != null && pendingBreak.damage == damage;
+        if (user == null) {
+            user = captured ? pendingBreak.user : getDamageUser(armorStand, damage, config);
+            if (user == null) {
+                user = "#entity";
+            }
+        }
+
         Location entityLocation = armorStand.getLocation();
         Block block = entityLocation.getBlock();
-        Database.containerBreakCheck(user, Material.ARMOR_STAND, armorStand, contents, block.getLocation());
+        if (config.ITEM_TRANSACTIONS) {
+            Database.containerBreakCheck(user, Material.ARMOR_STAND, armorStand, captured ? pendingBreak.contents : null, block.getLocation());
+        }
         Queue.queueBlockBreak(user, block.getState(), Material.ARMOR_STAND, null, (int) entityLocation.getYaw());
     }
 
-    public static void parseEntityKills(String message) {
-        message = message.trim().toLowerCase(Locale.ROOT);
-        if (!message.contains(" ")) {
-            return;
-        }
-
-        String[] args = message.split(" ");
-        if (args.length < 2 || !args[0].replaceFirst("/", "").equals("kill") || !args[1].startsWith("@e")) {
-            return;
-        }
-
-        List<LivingEntity> entityList = new ArrayList<>();
-        for (World world : Bukkit.getWorlds()) {
-            List<LivingEntity> livingEntities = world.getLivingEntities();
-            for (LivingEntity entity : livingEntities) {
-                if (entity instanceof Player) {
-                    continue;
-                }
-
-                if (entity.isValid()) {
-                    entityList.add(entity);
-                }
-            }
-        }
-
-        for (LivingEntity entity : entityList) {
-            Scheduler.runTask(CoreProtect.getInstance(), () -> {
-                if (entity != null && entity.isDead()) {
-                    logEntityDeath(entity, "#command");
-                }
-            }, entity);
-        }
-    }
-
-    protected static void logEntityDeath(LivingEntity entity, String e) {
-        if (!Config.getConfig(entity.getWorld()).ENTITY_KILLS) {
-            return;
-        }
-
-        EntityDamageEvent damage = entity.getLastDamageCause();
-        if (damage == null && e == null) {
-            return;
-        }
-
-        EntityDamageEvent.DamageCause cause = damage == null ? null : damage.getCause();
-        boolean isCommand = (cause == DamageCause.VOID && entity.getLocation().getBlockY() >= BukkitAdapter.ADAPTER.getMinHeight(entity.getWorld()));
-        if (e == null) {
-            e = isCommand ? "#command" : "";
-        }
-
-        if (entity.getType().name().equals("GLOW_SQUID") && cause == DamageCause.DROWNING) {
-            return;
-        }
-
-        List<DamageCause> validDamageCauses = Arrays.asList(DamageCause.SUICIDE, DamageCause.POISON, DamageCause.THORNS, DamageCause.MAGIC, DamageCause.WITHER);
-
-        boolean skip = true;
-        if (cause != null && (!Config.getConfig(entity.getWorld()).SKIP_GENERIC_DATA || (!(entity instanceof Zombie) && !(entity instanceof Skeleton)) || (validDamageCauses.contains(cause) || cause.name().equals("KILL")))) {
-            skip = false;
-        }
-
-        if (damage instanceof EntityDamageByEntityEvent) {
-            EntityDamageByEntityEvent attack = (EntityDamageByEntityEvent) damage;
-            Entity attacker = attack.getDamager();
-
-            if (attacker instanceof Player) {
-                Player player = (Player) attacker;
-                e = player.getName();
-            }
-            else if (attacker instanceof AbstractArrow) {
-                AbstractArrow arrow = (AbstractArrow) attacker;
-                ProjectileSource shooter = arrow.getShooter();
-
-                if (shooter instanceof Player) {
-                    Player player = (Player) shooter;
-                    e = player.getName();
-                }
-                else if (shooter instanceof LivingEntity) {
-                    EntityType entityType = ((LivingEntity) shooter).getType();
-                    if (entityType != null) { // Check for MyPet plugin
-                        String name = entityType.name().toLowerCase(Locale.ROOT);
-                        e = "#" + name;
-                    }
-                }
-            }
-            else if (attacker instanceof ThrownPotion) {
-                ThrownPotion potion = (ThrownPotion) attacker;
-                ProjectileSource shooter = potion.getShooter();
-
-                if (shooter instanceof Player) {
-                    Player player = (Player) shooter;
-                    e = player.getName();
-                }
-                else if (shooter instanceof LivingEntity) {
-                    EntityType entityType = ((LivingEntity) shooter).getType();
-                    if (entityType != null) { // Check for MyPet plugin
-                        String name = entityType.name().toLowerCase(Locale.ROOT);
-                        e = "#" + name;
-                    }
-                }
-            }
-            else if (attacker.getType().name() != null) {
-                e = "#" + attacker.getType().name().toLowerCase(Locale.ROOT);
-            }
-        }
-        else if (cause != null) {
-            if (cause.equals(EntityDamageEvent.DamageCause.FIRE)) {
-                e = "#fire";
-            }
-            else if (cause.equals(EntityDamageEvent.DamageCause.FIRE_TICK)) {
-                if (!skip) {
-                    e = "#fire";
-                }
-            }
-            else if (cause.equals(EntityDamageEvent.DamageCause.LAVA)) {
-                e = "#lava";
-            }
-            else if (cause.equals(EntityDamageEvent.DamageCause.BLOCK_EXPLOSION)) {
-                e = "#explosion";
-            }
-            else if (cause.equals(EntityDamageEvent.DamageCause.MAGIC)) {
-                e = "#magic";
-            }
-            else if (cause.equals(EntityDamageEvent.DamageCause.WITHER)) {
-                e = "#wither_effect";
-            }
-            else if (!cause.name().contains("_")) {
-                e = "#" + cause.name().toLowerCase(Locale.ROOT);
-            }
-        }
-
+    protected static void logEntityDeath(LivingEntity entity, String user) {
+        Config config = Config.getConfig(entity.getWorld());
         if (entity instanceof ArmorStand) {
-            Location entityLocation = entity.getLocation();
-            if (!Config.getConfig(entityLocation.getWorld()).ITEM_TRANSACTIONS) {
-                entityLocation.setY(entityLocation.getY() + 0.99);
-                Block block = entityLocation.getBlock();
-                Queue.queueBlockBreak(e, block.getState(), Material.ARMOR_STAND, null, (int) entityLocation.getYaw());
-            }
-            /*
-            else if (isCommand) {
-                entityLocation.setY(entityLocation.getY() + 0.99);
-                Block block = entityLocation.getBlock();
-                Database.containerBreakCheck(e, Material.ARMOR_STAND, entity, null, block.getLocation());
-                Queue.queueBlockBreak(e, block.getState(), Material.ARMOR_STAND, null, (int) entityLocation.getYaw());
-            }
-            */
+            logArmorStandBreak((ArmorStand) entity, user, config);
+            return;
+        }
+        if (!config.ENTITY_KILLS) {
             return;
         }
 
-        EntityType entity_type = entity.getType();
-        if (e.length() == 0) {
-            // assume killed self
-            if (!skip) {
-                if (!(entity instanceof Player) && entity_type.name() != null) {
-                    // Player player = (Player)entity;
-                    // e = player.getName();
-                    e = "#" + entity_type.name().toLowerCase(Locale.ROOT);
-                }
-                else if (entity instanceof Player) {
-                    e = entity.getName();
-                }
+        DamageCause cause = null;
+        if (user == null) {
+            EntityDamageEvent damage = entity.getLastDamageCause();
+            cause = damage == null ? null : damage.getCause();
+            if (cause == DamageCause.DROWNING && entity.getType().name().equals("GLOW_SQUID")) {
+                return;
             }
+            user = getDamageUser(entity, damage, config);
         }
 
-        if (e.startsWith("#wither") && !e.equals("#wither_effect")) {
-            e = "#wither";
-        }
-
-        if (e.startsWith("#enderdragon")) {
-            e = "#enderdragon";
-        }
-
-        if (e.startsWith("#primedtnt") || e.startsWith("#tnt")) {
-            e = "#tnt";
-        }
-
-        if (e.startsWith("#lightning")) {
-            e = "#lightning";
-        }
-
-        if (Config.getConfig(entity.getWorld()).DUPLICATE_SUPPRESSION && shouldSuppressEntityKill(e, entity, cause)) {
+        if (user == null || (config.DUPLICATE_SUPPRESSION && shouldSuppressEntityKill(user, entity, cause))) {
             return;
         }
 
-        if (e.length() > 0) {
+        if (!user.isEmpty()) {
+            if (entity instanceof Player) {
+                Queue.queuePlayerKill(user, entity.getLocation(), entity.getName());
+                return;
+            }
+
             List<Object> data = new ArrayList<>();
             List<Object> age = new ArrayList<>();
             List<Object> tame = new ArrayList<>();
             List<Object> attributes = new ArrayList<>();
             List<Object> details = LivingEntityDetails.serialize(entity);
             List<Object> info = new ArrayList<>();
-            EntityType type = entity_type;
 
             if (entity instanceof Ageable) {
                 Ageable ageable = (Ageable) entity;
@@ -332,9 +189,12 @@ public final class EntityDeathListener extends Queue implements Listener {
             if (entity instanceof Tameable) {
                 Tameable tameable = (Tameable) entity;
                 tame.add(tameable.isTamed());
-                if (tameable.isTamed()) {
-                    if (tameable.getOwner() != null) {
-                        tame.add(tameable.getOwner().getName());
+                AnimalTamer owner = tameable.isTamed() ? tameable.getOwner() : null;
+                if (owner != null) {
+                    tame.add(owner.getName());
+                    UUID ownerId = owner.getUniqueId();
+                    if (ownerId != null) {
+                        tame.add(ownerId.toString());
                     }
                 }
             }
@@ -342,7 +202,7 @@ public final class EntityDeathListener extends Queue implements Listener {
             long baselineBits = 0;
             if (entity instanceof Attributable) {
                 Attributable attributable = entity;
-                for (Attribute attribute : Lists.newArrayList(Registry.ATTRIBUTE)) {
+                for (Attribute attribute : Registry.ATTRIBUTE) {
                     AttributeInstance attributeInstance = attributable.getAttribute(attribute);
                     if (attributeInstance == null) {
                         continue;
@@ -377,10 +237,9 @@ public final class EntityDeathListener extends Queue implements Listener {
                 Enderman enderman = (Enderman) entity;
                 info.add(null);
 
-                try {
-                    info.add(enderman.getCarriedBlock().getAsString());
-                }
-                catch (Exception endermanException) {
+                BlockData carried = enderman.getCarriedBlock();
+                if (carried != null) {
+                    info.add(carried.getAsString());
                 }
             }
             else if (entity instanceof IronGolem) {
@@ -538,46 +397,17 @@ public final class EntityDeathListener extends Queue implements Listener {
                 info.add(abstractHorse.getJumpStrength());
                 info.add(abstractHorse.getMaxDomestication());
                 info.add(null);
-                info.add(null);
+                Map<String, Object> saddle = ItemUtils.serializeItemStack(abstractHorse.getInventory().getSaddle(), null, 0);
+                info.add(entity instanceof Horse || saddle.isEmpty() ? null : saddle);
 
                 if (entity instanceof Horse) {
                     Horse horse = (Horse) entity;
                     info.add(null);
-
-                    ItemStack saddle = horse.getInventory().getSaddle();
-                    if (saddle != null) {
-                        info.add(saddle.serialize());
-                    }
-                    else {
-                        info.add(null);
-                    }
-
+                    info.add(saddle.isEmpty() ? null : saddle);
                     info.add(horse.getColor());
                     info.add(horse.getStyle());
-
-                    ItemStack horseArmor = horse.getInventory().getArmor();
-                    if (horseArmor != null) {
-                        ItemStack armor = horseArmor.clone();
-                        ItemMeta itemMeta = armor.getItemMeta();
-                        Color color = null;
-                        if (itemMeta instanceof LeatherArmorMeta) {
-                            LeatherArmorMeta meta = (LeatherArmorMeta) itemMeta;
-                            color = meta.getColor();
-                            meta.setColor(null);
-                            armor.setItemMeta(meta);
-                        }
-                        info.add(armor.serialize());
-                        if (color != null) {
-                            info.add(color.serialize());
-                        }
-                        else {
-                            info.add(null);
-                        }
-                    }
-                    else {
-                        info.add(null);
-                        info.add(null);
-                    }
+                    Map<String, Object> armor = ItemUtils.serializeItemStack(horse.getInventory().getArmor(), null, 0);
+                    info.add(armor.isEmpty() ? null : armor);
                 }
                 else if (entity instanceof ChestedHorse) {
                     ChestedHorse chestedHorse = (ChestedHorse) entity;
@@ -585,13 +415,8 @@ public final class EntityDeathListener extends Queue implements Listener {
 
                     if (entity instanceof Llama) {
                         Llama llama = (Llama) entity;
-                        ItemStack decor = llama.getInventory().getDecor();
-                        if (decor != null) {
-                            info.add(decor.serialize());
-                        }
-                        else {
-                            info.add(null);
-                        }
+                        Map<String, Object> decor = ItemUtils.serializeItemStack(llama.getInventory().getDecor(), null, 0);
+                        info.add(decor.isEmpty() ? null : decor);
                         info.add(llama.getColor());
                     }
                 }
@@ -615,7 +440,7 @@ public final class EntityDeathListener extends Queue implements Listener {
                 PaperAdapter.ADAPTER.getEntityMeta(entity, info);
             }
 
-            trimTrailingNulls(info);
+            LivingEntityDetails.trimTrailingNulls(info);
             data.add(age);
             data.add(tame);
             data.add(info);
@@ -628,18 +453,36 @@ public final class EntityDeathListener extends Queue implements Listener {
             data.add(EntityUtil.BASELINE_ATTRIBUTES);
             data.add(baselineBits);
 
-            if (!(entity instanceof Player)) {
-                Queue.queueEntityKill(e, entity.getLocation(), data, type);
-            }
-            else {
-                Queue.queuePlayerKill(e, entity.getLocation(), entity.getName());
-            }
+            Queue.queueEntityKill(user, entity.getLocation(), data, entity.getType());
         }
     }
 
-    private static void trimTrailingNulls(List<Object> values) {
-        while (!values.isEmpty() && values.get(values.size() - 1) == null) {
-            values.remove(values.size() - 1);
+    private static String getDamageUser(LivingEntity entity, EntityDamageEvent damage, Config config) {
+        String user = EntityUtils.getBreakUser(EntityUtils.getDamager(damage), null);
+        if (user != null) {
+            return "#lightning_bolt".equals(user) ? "#lightning" : user;
+        }
+
+        DamageCause cause = damage == null ? null : damage.getCause();
+        if (cause == null) {
+            return null;
+        }
+
+        boolean skipGeneric = config.SKIP_GENERIC_DATA && (entity instanceof Zombie || entity instanceof Skeleton);
+        switch (cause) {
+            case FIRE:
+                return "#fire";
+            case FIRE_TICK:
+                return skipGeneric ? null : "#fire";
+            case BLOCK_EXPLOSION:
+                return "#explosion";
+            case WITHER:
+                return "#wither_effect";
+            case VOID:
+                return entity.getLocation().getBlockY() >= BukkitAdapter.ADAPTER.getMinHeight(entity.getWorld()) ? "#command" : "#void";
+            default:
+                String causeName = cause.name();
+                return skipGeneric && causeName.contains("_") ? null : "#" + causeName.toLowerCase(Locale.ROOT);
         }
     }
 
@@ -693,15 +536,9 @@ public final class EntityDeathListener extends Queue implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onEntityDeath(EntityDeathEvent event) {
-        /*
-        System.out.println("ENTITY DEATH - " + event.getEntity().getName());
-        if (event.getEntity().getKiller() != null) {
-            System.out.println("^ (killer): " + event.getEntity().getKiller().getName());
+        if (event instanceof Cancellable && ((Cancellable) event).isCancelled()) {
+            return;
         }
-        else if (event.getEntity().getLastDamageCause() != null) {
-            System.out.println("^ (damage cause): " + event.getEntity().getLastDamageCause().getEntity().getName());
-        }
-        */
 
         LivingEntity entity = event.getEntity();
         if (entity == null) {
@@ -712,10 +549,6 @@ public final class EntityDeathListener extends Queue implements Listener {
             EntityInteractionListener.flushPendingInteractions(entity);
             Queue.queueEntitySpawnRemoved(entity);
             EntitySpawnTracking.clearTracking(entity.getUniqueId());
-        }
-
-        if (entity instanceof ArmorStand && !(event instanceof Cancellable && ((Cancellable) event).isCancelled())) {
-            logArmorStandBreak((ArmorStand) entity);
         }
 
         logEntityDeath(entity, null);

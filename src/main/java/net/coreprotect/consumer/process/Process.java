@@ -26,8 +26,10 @@ import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.consumer.QueuePayload;
 import net.coreprotect.database.ConsumerEntitySpawnUpdates;
 import net.coreprotect.database.ConsumerWriteBatch;
+import net.coreprotect.database.ConsumerWriteBatch.ReferenceKind;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.DuckDBRecovery;
 import net.coreprotect.database.logger.EntityInteractionLogger;
@@ -169,11 +171,11 @@ public class Process {
         Map<Integer, Object> consumerObject = null;
         ConsumerWriteBatch writeBatch = null;
         Connection connection = null;
+        Statement statement = null;
         boolean pauseClaimed = false;
         boolean processingStarted = false;
         Object[] preparingEvent = null;
         boolean consumerDataCleared = false;
-        boolean preflightCommitted = false;
         boolean batchedDuckDBEntityEvent = false;
         int previousLockUpdate = lastLockUpdate;
         boolean lockUpdatePending = false;
@@ -199,7 +201,7 @@ public class Process {
                 return;
             }
 
-            Statement statement = connection.createStatement();
+            statement = connection.createStatement();
             Database.performCheckpoint(statement, ConfigHandler.databaseType);
 
             users = Consumer.consumerUsers.get(processId);
@@ -211,7 +213,6 @@ public class Process {
                 if (!ConfigHandler.databaseType.isDuckDB() || isLockUpdateDue(lastRun)) {
                     writeBatch = Database.openConsumerWriteBatch(connection);
                     if (!beginConsumerTransaction(writeBatch)) {
-                        statement.close();
                         deferConsumerRetry();
                         return;
                     }
@@ -219,13 +220,11 @@ public class Process {
                     updateLockTable(writeBatch, (lastRun ? 0 : 1));
                     lockUpdatePending = lastLockUpdate != previousLockUpdate;
                     if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
-                        statement.close();
                         deferConsumerRetry();
                         return;
                     }
                     lockUpdatePending = false;
                 }
-                statement.close();
                 Consumer.consumer_id.put(processId, new Integer[] { 0, 0 });
                 if (!Consumer.hasPendingConsumerData()) {
                     DuckDBRecovery.markHealthy();
@@ -262,6 +261,16 @@ public class Process {
                 }
                 else {
                     preflightUser(writeBatch, data, users);
+                    if (ConfigHandler.databaseType.isClickHouse() && writeBatch.shouldCommit()) {
+                        if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
+                            failConsumerBatch(consumerData, users, consumerObject, 0, 0);
+                            return;
+                        }
+                        if (!beginConsumerTransaction(writeBatch)) {
+                            deferConsumerRetry();
+                            return;
+                        }
+                    }
                 }
                 int action = (int) data[1];
                 hasEntitySpawnUpdates |= action == Process.ENTITY_SPAWN_UPDATE || action == Process.ENTITY_CONTAINER_TRANSITION_UPDATE;
@@ -270,19 +279,19 @@ public class Process {
                 hasEntityInteractions |= action == Process.ENTITY_INTERACTION;
 
                 if (action == Process.ENTITY_CONTAINER_TRANSACTION) {
-                    Object object = consumerObject.get((int) data[0]);
+                    Object object = QueuePayload.primary(consumerObject.get((int) data[0]));
                     if (object instanceof EntityContainerTransaction) {
                         entityIdentityUuids.add(((EntityContainerTransaction) object).getEntityUuid());
                     }
                 }
                 else if (action == Process.ENTITY_INTERACTION) {
-                    Object object = consumerObject.get((int) data[0]);
+                    Object object = QueuePayload.primary(consumerObject.get((int) data[0]));
                     if (object instanceof EntityInteraction) {
                         entityIdentityUuids.add(((EntityInteraction) object).getEntityUuid());
                     }
                 }
                 else if (action == Process.ENTITY_SPAWN_LOG) {
-                    Object object = consumerObject.get((int) data[0]);
+                    Object object = QueuePayload.primary(consumerObject.get((int) data[0]));
                     if (object instanceof EntitySpawnData) {
                         UUID uuid = ((EntitySpawnData) object).getUuid();
                         if (uuid != null) {
@@ -291,7 +300,7 @@ public class Process {
                     }
                 }
                 else if (action == Process.ENTITY_SPAWN_UPDATE || action == Process.ENTITY_CONTAINER_TRANSITION_UPDATE) {
-                    Object object = consumerObject.get((int) data[0]);
+                    Object object = QueuePayload.primary(consumerObject.get((int) data[0]));
                     EntitySpawnData spawnData = getEntitySpawnUpdate(object);
                     if (spawnData == null) {
                         continue;
@@ -328,14 +337,11 @@ public class Process {
                 updateLockTable(writeBatch, (lastRun ? 0 : 1));
                 lockUpdatePending = lastLockUpdate != previousLockUpdate;
                 if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
-                    invalidateUserCaches(users);
-                    failConsumerBatch(processId, consumerData, users, consumerObject, 0, 0);
+                    failConsumerBatch(consumerData, users, consumerObject, 0, 0);
                     return;
                 }
                 lockUpdatePending = false;
             }
-            preflightCommitted = true;
-
             if (hasEntityContainerTransactions || hasEntityInteractions || hasEntitySpawnLogs || !entityIdentityUuids.isEmpty() || !entityIdentityRowIds.isEmpty()) {
                 entitySpawnIdentities.putAll(EntitySpawnStatement.loadIdentities(connection, entityIdentityUuids));
                 Map<Integer, EntitySpawnIdentity> identitiesByRowId = EntitySpawnStatement.loadIdentitiesByRowIds(connection, entityIdentityRowIds);
@@ -380,19 +386,20 @@ public class Process {
                         }
                         completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
                         if (outcome != TransactionOutcome.COMMITTED) {
-                            completeFailedConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, i, outcome == TransactionOutcome.RETAINED);
+                            completeFailedConsumerBatch(consumerData, users, consumerObject, processedThrough, i, outcome == TransactionOutcome.RETAINED);
                             return;
                         }
                         if (!beginConsumerTransaction(writeBatch)) {
-                            retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
+                            retryConsumerBatch(consumerData, users, consumerObject, processedThrough);
                             return;
                         }
                     }
 
                     preparingEvent = data;
-                    if (users.get(id) != null && consumerObject.get(id) != null) {
+                    Object payload = consumerObject.get(id);
+                    if (users.get(id) != null && payload != null) {
                         String user = users.get(id)[0];
-                        Object object = consumerObject.get(id);
+                        Object object = QueuePayload.primary(payload);
 
                         try {
                             switch (action) {
@@ -464,7 +471,7 @@ public class Process {
                                     }
                                     break;
                                 case Process.ITEM_TRANSACTION:
-                                    ItemTransactionProcess.process(writeBatch, i, processId, id, forceData, replaceData, blockData, user, object);
+                                    ItemTransactionProcess.process(writeBatch, i, processId, id, forceData, replaceData, blockData, user, object, lastRun);
                                     break;
                                 case Process.STRUCTURE_GROWTH:
                                     StructureGrowthProcess.process(statement, writeBatch, i, processId, id, user, object, forceData);
@@ -488,7 +495,7 @@ public class Process {
                                     RollbackUpdateProcess.process(writeBatch, processId, id, forceData, RollbackUpdateTargets.BLOCK_INVENTORY);
                                     break;
                                 case Process.ENTITY_CONTAINER_ROLLBACK_UPDATE:
-                                    List<Object[]> entityContainerRows = Consumer.consumerObjectArrayList.get(processId).get(id);
+                                    List<Object[]> entityContainerRows = QueuePayload.detail(payload);
                                     if (entityContainerRows != null) {
                                         try {
                                             writeBatch.executeAtomically("entity_container_rollback", () -> RollbackUpdateProcess.processChecked(batch, entityContainerRows, forceData, RollbackUpdateTargets.ENTITY_CONTAINER, blockData == 1));
@@ -505,19 +512,19 @@ public class Process {
                                     entitySpawnUpdates.applyCombined(containerUpdate, () -> RollbackUpdateProcess.processChecked(batch, containerUpdate.getRows(), containerUpdate.getRollbackType(), RollbackUpdateTargets.ENTITY_CONTAINER, containerUpdate.isInventoryRollback()));
                                     break;
                                 case Process.WORLD_INSERT:
-                                    WorldInsertProcess.process(writeBatch, i, statement, object, forceData);
+                                    ConfigHandler.insertQueuedIdentifier(writeBatch, statement, ReferenceKind.WORLD, i, object, forceData);
                                     break;
                                 case Process.SIGN_UPDATE:
-                                    SignUpdateProcess.process(statement, object, user, blockData, forceData);
+                                    SignUpdateProcess.process(connection, object, replaceData, blockData, forceData);
                                     break;
                                 case Process.SKULL_UPDATE:
                                     SkullUpdateProcess.process(statement, object, forceData);
                                     break;
                                 case Process.PLAYER_CHAT:
-                                    PlayerChatProcess.process(writeBatch, i, processId, id, object, user);
+                                    PlayerMessageProcess.process(writeBatch, i, object, user, QueuePayload.detail(payload), false);
                                     break;
                                 case Process.PLAYER_COMMAND:
-                                    PlayerCommandProcess.process(writeBatch, i, processId, id, object, user);
+                                    PlayerMessageProcess.process(writeBatch, i, object, user, QueuePayload.detail(payload), true);
                                     break;
                                 case Process.PLAYER_LOGIN:
                                     PlayerLoginProcess.process(writeBatch, i, processId, id, object, blockData, replaceData, forceData, user);
@@ -535,19 +542,19 @@ public class Process {
                                     NaturalBlockBreakProcess.process(statement, writeBatch, i, processId, id, user, object, blockType, blockData, (String) data[7]);
                                     break;
                                 case Process.MATERIAL_INSERT:
-                                    MaterialInsertProcess.process(writeBatch, statement, i, object, forceData);
+                                    ConfigHandler.insertQueuedIdentifier(writeBatch, statement, ReferenceKind.MATERIAL, i, object, forceData);
                                     break;
                                 case Process.ART_INSERT:
-                                    ArtInsertProcess.process(writeBatch, statement, i, object, forceData);
+                                    ConfigHandler.insertQueuedIdentifier(writeBatch, statement, ReferenceKind.ART, i, object, forceData);
                                     break;
                                 case Process.ENTITY_INSERT:
-                                    EntityInsertProcess.process(writeBatch, statement, i, object, forceData);
+                                    ConfigHandler.insertQueuedIdentifier(writeBatch, statement, ReferenceKind.ENTITY, i, object, forceData);
                                     break;
                                 case Process.PLAYER_KILL:
                                     PlayerKillProcess.process(writeBatch, i, id, object, user);
                                     break;
                                 case Process.BLOCKDATA_INSERT:
-                                    BlockDataInsertProcess.process(writeBatch, statement, i, object, forceData);
+                                    ConfigHandler.insertQueuedIdentifier(writeBatch, statement, ReferenceKind.BLOCK_DATA, i, object, forceData);
                                     break;
                                 case Process.ENTITY_SPAWN_LOG:
                                     if (!(object instanceof EntitySpawnData)) {
@@ -618,11 +625,11 @@ public class Process {
                                 }
                                 completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
                                 if (outcome != TransactionOutcome.COMMITTED) {
-                                    completeFailedConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, i + 1, outcome == TransactionOutcome.RETAINED);
+                                    completeFailedConsumerBatch(consumerData, users, consumerObject, processedThrough, i + 1, outcome == TransactionOutcome.RETAINED);
                                     return;
                                 }
                                 if (ConfigHandler.databaseType.isClickHouse()) {
-                                    releaseProcessedConsumerData(processId, consumerData, users, consumerObject, batchStart, processedThrough);
+                                    releaseProcessedConsumerData(consumerData, users, consumerObject, batchStart, processedThrough);
                                 }
                                 boolean backlog = batchLimitReached && ConfigHandler.databaseType.isClickHouse() && i + 1 < consumerDataSize;
                                 if (interrupted || backlog) {
@@ -631,12 +638,12 @@ public class Process {
                                     }
                                     catch (InterruptedException exception) {
                                         Thread.currentThread().interrupt();
-                                        retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
+                                        retryConsumerBatch(consumerData, users, consumerObject, processedThrough);
                                         return;
                                     }
                                 }
                                 if (!beginConsumerTransaction(writeBatch)) {
-                                    retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
+                                    retryConsumerBatch(consumerData, users, consumerObject, processedThrough);
                                     return;
                                 }
                                 if (entitySpawnUpdates != null) {
@@ -677,11 +684,11 @@ public class Process {
                         }
                         completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
                         if (outcome != TransactionOutcome.COMMITTED) {
-                            completeFailedConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, i + 1, outcome == TransactionOutcome.RETAINED);
+                            completeFailedConsumerBatch(consumerData, users, consumerObject, processedThrough, i + 1, outcome == TransactionOutcome.RETAINED);
                             return;
                         }
                         if (!beginConsumerTransaction(writeBatch)) {
-                            retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
+                            retryConsumerBatch(consumerData, users, consumerObject, processedThrough);
                             return;
                         }
                     }
@@ -697,26 +704,21 @@ public class Process {
             }
             completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
             if (outcome != TransactionOutcome.COMMITTED) {
-                completeFailedConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, consumerData.size(), outcome == TransactionOutcome.RETAINED);
+                completeFailedConsumerBatch(consumerData, users, consumerObject, processedThrough, consumerData.size(), outcome == TransactionOutcome.RETAINED);
                 return;
             }
-            clearConsumerData(processId, consumerData, users, consumerObject);
+            clearConsumerData(consumerData, users, consumerObject);
             consumerDataCleared = true;
-
-            statement.close();
         }
         catch (Exception e) {
             boolean recoveryRequested = DuckDBRecovery.request(e);
             if (writeBatch != null && Consumer.transacting) {
                 writeBatch.rollback();
             }
-            if (!preflightCommitted && users != null) {
-                invalidateUserCaches(users);
-            }
             if (processingStarted && !consumerDataCleared && consumerData != null && users != null && consumerObject != null) {
                 try {
                     completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, TransactionOutcome.RETAINED);
-                    discardProcessedConsumerData(processId, consumerData, users, consumerObject, processedThrough);
+                    discardProcessedConsumerData(consumerData, users, consumerObject, processedThrough);
                     consumerDataCleared = consumerData.isEmpty();
                 }
                 catch (Exception cleanupException) {
@@ -742,6 +744,14 @@ public class Process {
         finally {
             if (lockUpdatePending) {
                 lastLockUpdate = previousLockUpdate;
+            }
+            if (statement != null) {
+                try {
+                    statement.close();
+                }
+                catch (Exception e) {
+                    Database.reportDatabaseFailure(e);
+                }
             }
             if (writeBatch != null) {
                 try {
@@ -785,7 +795,7 @@ public class Process {
                 continue;
             }
 
-            Object object = consumerObjects.get((int) data[0]);
+            Object object = QueuePayload.primary(consumerObjects.get((int) data[0]));
             EntitySpawnData spawnData = getEntitySpawnUpdate(object);
             if (spawnData == null) {
                 continue;
@@ -966,8 +976,37 @@ public class Process {
         }
         String user = StringUtils.normalizeUsername(userData[0]);
         String uuid = userData[1];
-        return user != null && ((ConfigHandler.databaseType.isClickHouse() && uuid != null && !uuid.isEmpty())
+        boolean hasUuid = uuid != null && !uuid.isEmpty();
+        if (!hasUuid && data.length > 1 && data[1] instanceof Integer && Config.getGlobal().API_ENABLED && resolvesUserAfterPreLog((Integer) data[1])) {
+            return false;
+        }
+        return user != null && ((ConfigHandler.databaseType.isClickHouse() && hasUuid)
                 || ConfigHandler.playerIdCache.get(user.toLowerCase(Locale.ROOT)) == null);
+    }
+
+    private static boolean resolvesUserAfterPreLog(int action) {
+        switch (action) {
+            case BLOCK_BREAK:
+            case BLOCK_PLACE:
+            case SIGN_TEXT:
+            case CONTAINER_BREAK:
+            case PLAYER_INTERACTION:
+            case CONTAINER_TRANSACTION:
+            case STRUCTURE_GROWTH:
+            case PLAYER_CHAT:
+            case PLAYER_COMMAND:
+            case PLAYER_LOGOUT:
+            case ENTITY_KILL:
+            case NATURAL_BLOCK_BREAK:
+            case PLAYER_KILL:
+            case ITEM_TRANSACTION:
+            case ENTITY_SPAWN_LOG:
+            case ENTITY_CONTAINER_TRANSACTION:
+            case ENTITY_INTERACTION:
+                return true;
+            default:
+                return false;
+        }
     }
 
     static void preflightUser(ConsumerWriteBatch batch, Object[] data,
@@ -982,8 +1021,8 @@ public class Process {
         currentConsumerSize = 0;
     }
 
-    static void retryConsumerBatch(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int processedThrough) {
-        discardProcessedConsumerData(processId, consumerData, users, consumerObject, processedThrough);
+    static void retryConsumerBatch(ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int processedThrough) {
+        discardProcessedConsumerData(consumerData, users, consumerObject, processedThrough);
         deferConsumerRetry();
     }
 
@@ -997,46 +1036,31 @@ public class Process {
         }
     }
 
-    static void failConsumerBatch(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int processedThrough, int discardThrough) {
-        discardProcessedConsumerData(processId, consumerData, users, consumerObject, processedThrough);
-        discardProcessedConsumerData(processId, consumerData, users, consumerObject, Math.max(0, discardThrough - processedThrough));
+    static void failConsumerBatch(ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int processedThrough, int discardThrough) {
+        discardProcessedConsumerData(consumerData, users, consumerObject, processedThrough);
+        discardProcessedConsumerData(consumerData, users, consumerObject, Math.max(0, discardThrough - processedThrough));
         deferConsumerRetry();
     }
 
-    static void completeFailedConsumerBatch(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users,
+    static void completeFailedConsumerBatch(ArrayList<Object[]> consumerData, Map<Integer, String[]> users,
             Map<Integer, Object> consumerObject, int processedThrough, int attemptedThrough, boolean retainAttemptedRows) {
         if (retainAttemptedRows) {
-            retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
+            retryConsumerBatch(consumerData, users, consumerObject, processedThrough);
         }
         else {
-            failConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, attemptedThrough);
+            failConsumerBatch(consumerData, users, consumerObject, processedThrough, attemptedThrough);
         }
     }
 
-    private static void invalidateUserCaches(Map<Integer, String[]> users) {
-        for (String[] data : users.values()) {
-            if (data == null || data.length == 0 || data[0] == null) {
-                continue;
-            }
-            String user = StringUtils.normalizeUsername(data[0]).toLowerCase(Locale.ROOT);
-            Integer userId = ConfigHandler.playerIdCache.remove(user);
-            if (userId != null) {
-                ConfigHandler.playerIdCacheReversed.remove(userId);
-            }
-            String uuid = ConfigHandler.uuidCache.remove(user);
-            if (uuid != null) {
-                ConfigHandler.uuidCacheReversed.remove(uuid);
-            }
-        }
-    }
-
-    private static void discardProcessedConsumerData(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int count) {
+    private static void discardProcessedConsumerData(ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int count) {
         int processed = Math.min(count, consumerData.size());
-        releaseProcessedConsumerData(processId, consumerData, users, consumerObject, 0, processed);
-        consumerData.subList(0, processed).clear();
+        releaseProcessedConsumerData(consumerData, users, consumerObject, 0, processed);
+        synchronized (Queue.class) {
+            consumerData.subList(0, processed).clear();
+        }
     }
 
-    private static void releaseProcessedConsumerData(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int fromIndex, int toIndex) {
+    private static void releaseProcessedConsumerData(ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, int fromIndex, int toIndex) {
         for (int index = fromIndex; index < toIndex; index++) {
             Object[] data = consumerData.get(index);
             if (data == null) {
@@ -1045,7 +1069,7 @@ public class Process {
             eventFailures.remove(data);
             transactionFailures.remove(data);
             Integer id = (Integer) data[0];
-            discardConsumerData(processId, users, consumerObject, id, (int) data[1]);
+            discardConsumerData(users, consumerObject, id, (int) data[1]);
             consumerData.set(index, null);
         }
     }
@@ -1056,7 +1080,9 @@ public class Process {
         if (failedIndex == -1) {
             return;
         }
-        consumerData.remove(failedIndex);
+        synchronized (Queue.class) {
+            consumerData.remove(failedIndex);
+        }
         eventFailures.remove(failedEvent);
         transactionFailures.remove(failedEvent);
         Set<Integer> failedIds;
@@ -1074,7 +1100,7 @@ public class Process {
         }
         int action = failedEvent.length > 1 && failedEvent[1] instanceof Integer ? (int) failedEvent[1] : -1;
         for (int id : failedIds) {
-            Object object = consumerObject.get(id);
+            Object object = QueuePayload.primary(consumerObject.get(id));
             try {
                 String[] userData = users.get(id);
                 if (object instanceof Location && userData != null && userData.length > 0 && userData[0] != null
@@ -1108,7 +1134,7 @@ public class Process {
                 failure.addSuppressed(cleanupException);
             }
             finally {
-                discardConsumerData(processId, users, consumerObject, id, action);
+                discardConsumerData(users, consumerObject, id, action);
             }
         }
     }
@@ -1120,7 +1146,7 @@ public class Process {
         }
         int id = (int) data[0];
         String[] userData = Consumer.consumerUsers.get(processId).get(id);
-        Object object = Consumer.consumerObjects.get(processId).get(id);
+        Object object = QueuePayload.primary(Consumer.consumerObjects.get(processId).get(id));
         if (userData == null || userData.length == 0 || userData[0] == null || !(object instanceof Location)) {
             return null;
         }
@@ -1146,8 +1172,8 @@ public class Process {
         return false;
     }
 
-    private static void discardConsumerData(int processId, Map<Integer, String[]> users, Map<Integer, Object> consumerObject, Integer id, int action) {
-        Object object = consumerObject.get(id);
+    private static void discardConsumerData(Map<Integer, String[]> users, Map<Integer, Object> consumerObject, Integer id, int action) {
+        Object object = QueuePayload.primary(consumerObject.get(id));
         if (action == -1) {
             if (object instanceof EntityContainerRollbackUpdate) {
                 action = ENTITY_CONTAINER_TRANSITION_UPDATE;
@@ -1161,13 +1187,6 @@ public class Process {
         }
         users.remove(id);
         consumerObject.remove(id);
-        Consumer.consumerStrings.get(processId).remove(id);
-        Consumer.consumerSigns.get(processId).remove(id);
-        Consumer.consumerContainers.get(processId).remove(id);
-        Consumer.consumerInventories.get(processId).remove(id);
-        Consumer.consumerBlockList.get(processId).remove(id);
-        Consumer.consumerObjectArrayList.get(processId).remove(id);
-        Consumer.consumerObjectList.get(processId).remove(id);
     }
 
     private static boolean shouldLimitEventRetries(Throwable failure) {
@@ -1251,8 +1270,8 @@ public class Process {
         });
     }
 
-    private static void clearConsumerData(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject) {
-        discardProcessedConsumerData(processId, consumerData, users, consumerObject, consumerData.size());
+    private static void clearConsumerData(ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject) {
+        discardProcessedConsumerData(consumerData, users, consumerObject, consumerData.size());
         users.clear();
         consumerObject.clear();
     }
@@ -1347,7 +1366,7 @@ public class Process {
     }
 
     private static TransactionOutcome failedCommitOutcome(ConsumerWriteBatch batch) {
-        return ConfigHandler.databaseType.isClickHouse() || batch.wasCommitAttempted() ? TransactionOutcome.DISCARDED : TransactionOutcome.RETAINED;
+        return !batch.wasCommitAttempted() || batch.wasCommitDefinitelyRejected() ? TransactionOutcome.RETAINED : TransactionOutcome.DISCARDED;
     }
 
     private static void completeTransactionState(ConsumerEntitySpawnUpdates entitySpawnUpdates, List<PendingEntityContainerTransaction> pendingEntityContainerTransactions, List<EntityContainerRollbackRetry> pendingEntityContainerRollbacks, List<PendingEntityInteraction> pendingEntityInteractions, Map<UUID, Location> pendingEntityIdentityConfirmations, Set<UUID> invalidatedEntityIdentityConfirmations, Set<UUID> promotedEntityIdentities, Map<UUID, EntitySpawnIdentity> entitySpawnIdentities, List<PendingEntitySpawnLog> pendingEntitySpawnLogs, TransactionOutcome outcome) {

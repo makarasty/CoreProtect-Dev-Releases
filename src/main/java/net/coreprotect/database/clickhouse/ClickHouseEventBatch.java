@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.UUID;
 
+import net.coreprotect.database.ConsumerWriteBatch.ReferenceKind;
 import net.coreprotect.database.DatabaseType;
 import net.coreprotect.database.statement.BlockStatement;
 import net.coreprotect.utility.serialize.BlockMetaCodec;
@@ -36,6 +37,28 @@ public final class ClickHouseEventBatch implements AutoCloseable {
     ClickHouseEventBatch(ClickHouseBatchIdentity identity, ClickHouseRowIdAllocator rowIdAllocator) {
         this.identity = Objects.requireNonNull(identity, "identity");
         this.rowIdAllocator = Objects.requireNonNull(rowIdAllocator, "rowIdAllocator");
+    }
+
+    void addReference(ReferenceKind kind, int id, String value) throws SQLException {
+        switch (kind) {
+            case ART:
+                addArtMap(id, value);
+                break;
+            case BLOCK_DATA:
+                addBlockDataMap(id, value);
+                break;
+            case ENTITY:
+                addEntityMap(id, value);
+                break;
+            case MATERIAL:
+                addMaterialMap(id, value);
+                break;
+            case WORLD:
+                addWorld(id, value);
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported ClickHouse reference kind: " + kind);
+        }
     }
 
     public long addArtMap(int id, String art) throws SQLException {
@@ -269,6 +292,10 @@ public final class ClickHouseEventBatch implements AutoCloseable {
         return eventCount;
     }
 
+    int storageRowCount() {
+        return partitionRowCounts.values().stream().mapToInt(Integer::intValue).sum();
+    }
+
     int logicalSize() {
         return eventCount - duplicateVersionCount;
     }
@@ -392,7 +419,7 @@ public final class ClickHouseEventBatch implements AutoCloseable {
         set("batch_ordinal", eventCount);
         set("family", family.getTableName());
         set("rowid", rowId);
-        set("time", time);
+        set("time", Integer.toUnsignedLong(time));
         if (family == ClickHouseFamily.USER) {
             set("data", Integer.toUnsignedLong(time));
         }
@@ -489,8 +516,7 @@ public final class ClickHouseEventBatch implements AutoCloseable {
 
     private void commitRow(ClickHouseFamily family, long rowId) throws SQLException {
         int partitionId = ClickHouseSchema.eventPartitionId(family, currentTime);
-        rows.commitRow(family.getTableName() + " event", partitionId);
-        int rowCount = ClickHouseLookupIndex.append(rows, family, partitionId, false) ? 2 : 1;
+        int rowCount = ClickHouseLookupIndex.commitIndexedRow(rows, family, partitionId, false);
         partitionRowCounts.merge(partitionId, rowCount, Math::addExact);
         if (isVersionedFamily(family) && !versionRowIds.computeIfAbsent(family, ignored -> new HashSet<>()).add(rowId)) {
             duplicateVersionCount++;

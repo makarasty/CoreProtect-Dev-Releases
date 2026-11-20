@@ -17,8 +17,12 @@ import org.bukkit.block.Sign;
 import org.bukkit.block.Skull;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Arrow;
+import org.bukkit.entity.AbstractArrow;
+import org.bukkit.entity.Boat;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Firework;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Painting;
 import org.bukkit.entity.Player;
@@ -298,6 +302,10 @@ public interface BukkitInterface {
      */
     ItemStack getArrowMeta(Arrow arrow, ItemStack itemStack);
 
+    ItemStack getArrowItem(AbstractArrow arrow);
+
+    LivingEntity getFireworkRider(Firework firework);
+
     // --------------------------------------------------------------------------
     // Entity methods
     // --------------------------------------------------------------------------
@@ -310,6 +318,12 @@ public interface BukkitInterface {
      * @return true when entity data is ready
      */
     boolean isChunkEntitiesLoaded(Chunk chunk);
+
+    String getBoatVariant(Boat boat);
+
+    void setBoatVariant(Boat boat, String variant);
+
+    EntityType resolveStoredBoatType(boolean chest, String variant);
 
     /**
      * Gets metadata from a living entity.
@@ -403,7 +417,7 @@ public interface BukkitInterface {
      *            The material
      * @return The frame class
      */
-    Class<?> getFrameClass(Material material);
+    Class<? extends ItemFrame> getFrameClass(Material material);
 
     /**
      * Spawns an entity, running a function on it before it is added to the world.

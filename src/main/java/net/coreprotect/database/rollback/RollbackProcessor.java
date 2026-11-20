@@ -9,48 +9,58 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
-import org.bukkit.block.BlockFace;
-import org.bukkit.block.BlockState;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.Powerable;
-import org.bukkit.block.data.type.Jukebox;
-import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.ItemFrame;
-import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.PlayerInventory;
 
 import net.coreprotect.CoreProtect;
 import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
+import net.coreprotect.consumer.Queue;
+import net.coreprotect.consumer.process.Process;
+import net.coreprotect.database.rollback.RollbackBlockHandler.BlockReplayResult;
+import net.coreprotect.database.rollback.RollbackUtil.ContainerReplayResult;
 import net.coreprotect.listener.player.InventoryChangeListener;
-import net.coreprotect.model.BlockGroup;
 import net.coreprotect.model.PendingBlockChange;
 import net.coreprotect.model.action.LookupActions;
+import net.coreprotect.model.rollback.RollbackUpdateTargets;
 import net.coreprotect.model.item.ItemTransactionActions;
+import net.coreprotect.model.item.InventorySources;
 import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.thread.Scheduler;
 import net.coreprotect.utility.BlockUtils;
+import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.MaterialUtils;
 import net.coreprotect.utility.Teleport;
 import net.coreprotect.utility.ErrorReporter;
+import net.coreprotect.utility.entity.EntityUtil;
 
-public class RollbackProcessor {
+public class RollbackProcessor extends Queue {
 
     private static void normalizeRollbackBlockData(BlockData blockData) {
         if (blockData instanceof Powerable && blockData.getMaterial() == Material.NOTE_BLOCK) {
             ((Powerable) blockData).setPowered(false);
         }
+    }
+
+    private static boolean isEntityPlacementMaterial(Material material) {
+        return BukkitAdapter.ADAPTER.isItemFrame(material) || material == Material.PAINTING
+                || material == Material.ARMOR_STAND || material == Material.END_CRYSTAL;
     }
 
     /**
@@ -80,16 +90,20 @@ public class RollbackProcessor {
      *            The rollback-scoped BlockData parse cache
      * @param inventoryContext
      *            If not null, player inventory changes are scheduled on each player's entity scheduler as mutations of this rollback context (Folia)
+     * @param counters
+     *            Counts world changes applied by this chunk
      * @return True if successful, false if there was an error
      */
-    public static boolean processChunk(int finalChunkX, int finalChunkZ, long chunkKey, ArrayList<Object[]> blockList, ArrayList<Object[]> itemList, int rollbackType, int preview, String finalUserString, Player finalUser, World bukkitRollbackWorld, boolean inventoryRollback, RollbackBlockDataCache blockDataCache, EntitySpawnRollbackHandler.Context inventoryContext) {
-        RollbackCounters counters = new RollbackCounters();
-
+    public static boolean processChunk(int finalChunkX, int finalChunkZ, long chunkKey, ArrayList<Object[]> blockList, ArrayList<Object[]> itemList, int rollbackType, int preview, String finalUserString, Player finalUser, World bukkitRollbackWorld, boolean inventoryRollback, RollbackBlockDataCache blockDataCache, EntitySpawnRollbackHandler.Context inventoryContext, RollbackCounters counters) {
+        ChunkBlockChanges chunkChanges = new ChunkBlockChanges();
         try {
+            if (preview > 0 && finalUser == null) {
+                return true;
+            }
+
             boolean clearInventories = Config.getGlobal().ROLLBACK_ITEMS;
             ArrayList<Object[]> data = blockList != null ? blockList : new ArrayList<>();
             ArrayList<Object[]> itemData = itemList != null ? itemList : new ArrayList<>();
-            Map<Block, PendingBlockChange> chunkChanges = new LinkedHashMap<>();
             loadChunk(bukkitRollbackWorld, finalChunkX, finalChunkZ, inventoryRollback);
 
             if (!data.isEmpty() && (Integer) data.get(0)[8] == LookupActions.SIGN) {
@@ -132,7 +146,7 @@ public class RollbackProcessor {
                     normalizeRollbackBlockData(rawBlockData);
                 }
 
-                String rowUser = ConfigHandler.playerIdCacheReversed.get((Integer) row[2]);
+                String rowUser = ConfigHandler.playerIdCacheReversed.getOrDefault((Integer) row[2], "");
                 int oldTypeRaw = rowTypeRaw;
                 Material oldTypeMaterial = MaterialUtils.getType(oldTypeRaw);
 
@@ -155,28 +169,34 @@ public class RollbackProcessor {
                     rowTypeRaw = 0;
                 }
                 if (preview > 0) {
-                    if (rowAction != 3) { // entity kill
-                        Block block = bukkitRollbackWorld.getBlockAt(rowX, rowY, rowZ);
-                        if (preview == 2) {
-                            Material blockType = block.getType();
-                            if (!BukkitAdapter.ADAPTER.isItemFrame(blockType) && !blockType.equals(Material.PAINTING) && !blockType.equals(Material.ARMOR_STAND) && !blockType.equals(Material.END_CRYSTAL)) {
-                                BlockUtils.prepareTypeAndData(chunkChanges, block, blockType, block.getBlockData(), true);
-                                counters.addBlocks(1);
-                            }
-                        }
-                        else {
-                            if ((!BukkitAdapter.ADAPTER.isItemFrame(rowType)) && (rowType != Material.PAINTING) && (rowType != Material.ARMOR_STAND) && (rowType != Material.END_CRYSTAL)) {
-                                BlockUtils.prepareTypeAndData(chunkChanges, block, rowType, blockData, true);
-                                counters.addBlocks(1);
-                            }
-                        }
-                    }
-                    else {
+                    if (rowAction == LookupActions.ENTITY_KILL) {
                         counters.addEntities(1);
                     }
+                    else if (rowAction != LookupActions.ENTITY_SPAWN && !isEntityPlacementMaterial(oldTypeMaterial) && !isEntityPlacementMaterial(rowType)) {
+                        Block block = bukkitRollbackWorld.getBlockAt(rowX, rowY, rowZ);
+                        if (preview == 2) {
+                            BlockUtils.prepareTypeAndData(chunkChanges, block, block.getType(), block.getBlockData(), true);
+                        }
+                        else {
+                            BlockUtils.prepareTypeAndData(chunkChanges, block, rowType, blockData, true);
+                        }
+                        counters.addBlocks(1);
+                    }
                 }
-                else if (rowAction == 3) { // entity kill
-                    counters.addEntities(RollbackEntityHandler.processEntity(bukkitRollbackWorld, oldTypeRaw, rowTypeRaw, rowData, rowAction, rowRolledBack, rowX, rowY, rowZ, rowWorldId, rowUser));
+                else if (rowAction == LookupActions.ENTITY_KILL && rollbackType == 0 && inventoryContext != null) {
+                    if (rowRolledBack == 0) {
+                        restoreLegacyKill(inventoryContext, bukkitRollbackWorld, row);
+                    }
+                }
+                else if (rowAction == LookupActions.ENTITY_KILL) {
+                    AtomicBoolean removalStarted = new AtomicBoolean();
+                    int entities = RollbackEntityHandler.processEntity(bukkitRollbackWorld, oldTypeRaw, rowTypeRaw, rowData, rowAction, rowRolledBack, rowX, rowY, rowZ, rowWorldId, rowUser,
+                            inventoryContext == null ? null : () -> beginDeferredMutation(inventoryContext, removalStarted),
+                            inventoryContext == null ? null : removal -> publishDeferredChange(inventoryContext, removalStarted, removal, row, rollbackType, false, true));
+                    counters.addEntities(entities);
+                    if (entities > 0) {
+                        chunkChanges.recordReplay(null, row, BlockReplayResult.APPLIED, true);
+                    }
                 }
                 else {
                     Block block = bukkitRollbackWorld.getBlockAt(rowX, rowY, rowZ);
@@ -200,7 +220,7 @@ public class RollbackProcessor {
                         countBlock = false;
                     }
 
-                    if ((rowType == pendingChangeType) && ((!BukkitAdapter.ADAPTER.isItemFrame(oldTypeMaterial)) && (oldTypeMaterial != Material.PAINTING) && (oldTypeMaterial != Material.ARMOR_STAND)) && (oldTypeMaterial != Material.END_CRYSTAL)) {
+                    if (rowType == pendingChangeType && !isEntityPlacementMaterial(oldTypeMaterial)) {
                         // block is already changed!
                         BlockData checkData = rowType == Material.AIR ? blockData : rawBlockData;
                         if (checkData != null) {
@@ -229,228 +249,369 @@ public class RollbackProcessor {
                         }
                     }
 
-                    if (RollbackBlockHandler.processBlockChange(bukkitRollbackWorld, block, row, rollbackType, clearInventories, chunkChanges, countBlock, oldTypeMaterial, pendingChangeType, pendingChangeData, counters, rawBlockData, changeType, changeBlock, changeBlockData, meta != null ? new ArrayList<>(meta) : null, blockData, rowUser, rowType, rowX, rowY, rowZ, rowTypeRaw, rowData, rowAction, rowWorldId, BlockUtils.byteDataToString((byte[]) row[13], rowTypeRaw)) && countBlock) {
-                        counters.addBlocks(1);
-                    }
+                    BlockReplayResult result = RollbackBlockHandler.processBlockChange(bukkitRollbackWorld, block, row, rollbackType, clearInventories, chunkChanges, countBlock, oldTypeMaterial, pendingChangeType, pendingChangeData, counters, rawBlockData, changeType, changeBlock, changeBlockData, meta != null ? new ArrayList<>(meta) : null, blockData, rowUser, rowType, rowX, rowY, rowZ, rowTypeRaw, rowData, rowAction, rowWorldId, blockDataString, inventoryContext);
+                    boolean markApplied = result.applied() && oldTypeMaterial != null && rowType != null && rowRolledBack == rollbackType;
+                    chunkChanges.recordReplay(block, row, result, markApplied);
                 }
             }
             data.clear();
 
-            // Apply cached block changes
-            RollbackBlockHandler.applyBlockChanges(chunkChanges, preview, finalUser instanceof Player ? (Player) finalUser : null);
+            RollbackBlockHandler.applyBlockChanges(chunkChanges, preview, finalUser, chunkChanges::confirmPendingWrite);
+            chunkChanges.publishAppliedRows(finalUserString, rollbackType, counters);
+            if (preview > 0) {
+                return true;
+            }
 
-            // Process container items
-            Map<Player, List<Integer>> sortPlayers = new HashMap<>();
-            Map<Player, List<InventoryRow>> inventoryRows = inventoryContext != null && inventoryRollback ? new LinkedHashMap<>() : null;
-            Object container = null;
-            Material containerType = null;
-            boolean containerInit = false;
-            int lastX = 0;
-            int lastY = 0;
-            int lastZ = 0;
-            int lastWorldId = 0;
-            String lastFace = "";
-
-            for (Object[] row : itemData) {
-                int rowX = (Integer) row[3];
-                int rowY = (Integer) row[4];
-                int rowZ = (Integer) row[5];
-                int rowTypeRaw = (Integer) row[6];
-                int rowData = (Integer) row[7];
-                int rowAction = (Integer) row[8];
-                int rowRolledBack = MaterialUtils.rolledBack((Integer) row[9], false);
-                int rowWorldId = (Integer) row[10];
-                int rowAmount = (Integer) row[11];
-                byte[] rowMetadata = (byte[]) row[12];
-                Material rowType = MaterialUtils.getType(rowTypeRaw);
-
-                int rolledBackInventory = MaterialUtils.rolledBack((Integer) row[9], true);
-                if (rowType != null) {
-                    if (inventoryRollback && ((rollbackType == 0 && rolledBackInventory == 0) || (rollbackType == 1 && rolledBackInventory == 1))) {
-                        Material inventoryItem = ItemUtils.inventoryItemFilter(rowType, ((Integer) row[14] == 0));
-                        if (inventoryItem == null) {
-                            continue;
-                        }
-
-                        int rowUserId = (Integer) row[2];
-                        String rowUser = ConfigHandler.playerIdCacheReversed.get(rowUserId);
-                        if (rowUser == null) {
-                            continue;
-                        }
-
-                        String uuid = ConfigHandler.uuidCache.get(rowUser.toLowerCase(Locale.ROOT));
-                        if (uuid == null) {
-                            continue;
-                        }
-
-                        Player player = Bukkit.getServer().getPlayer(UUID.fromString(uuid));
-                        if (player == null) {
-                            continue;
-                        }
-
-                        if (inventoryRows != null) {
-                            inventoryRows.computeIfAbsent(player, key -> new ArrayList<>()).add(new InventoryRow(row, inventoryItem));
-                            continue;
-                        }
-
-                        int modifiedArmor = applyInventoryRow(player, row, inventoryItem, rollbackType);
-                        if (modifiedArmor > -1) {
-                            List<Integer> currentSortList = sortPlayers.getOrDefault(player, new ArrayList<>());
-                            if (!currentSortList.contains(modifiedArmor)) {
-                                currentSortList.add(modifiedArmor);
-                            }
-                            sortPlayers.put(player, currentSortList);
-                        }
-
-                        counters.addItems(rowAmount);
-                        continue; // remove this for merged rollbacks in future? (be sure to re-enable chunk sorting)
-                    }
-
-                    if (inventoryRollback || rowAction > 1) {
-                        continue; // skip inventory & ender chest transactions
-                    }
-
-                    if ((rollbackType == 0 && rowRolledBack == 0) || (rollbackType == 1 && rowRolledBack == 1)) {
-                        ItemStack itemstack = new ItemStack(rowType, rowAmount);
-                        Object[] populatedStack = RollbackItemHandler.populateItemStack(itemstack, rowMetadata);
-                        String faceData = (String) populatedStack[1];
-
-                        if (!containerInit || rowX != lastX || rowY != lastY || rowZ != lastZ || rowWorldId != lastWorldId || !faceData.equals(lastFace)) {
-                            container = null; // container patch 2.14.0
-                            Block block = bukkitRollbackWorld.getBlockAt(rowX, rowY, rowZ);
-
-                            if (BlockGroup.CONTAINERS.contains(block.getType())) {
-                                BlockState blockState = block.getState();
-                                if (blockState instanceof Jukebox) {
-                                    container = blockState;
-                                }
-                                else {
-                                    container = BlockUtils.getContainerInventory(blockState, false);
-                                    if (container instanceof Inventory) {
-                                        InventoryChangeListener.flushPendingContainer((Inventory) container, block.getLocation());
-                                    }
-                                }
-
-                                containerType = block.getType();
-                            }
-                            else if (BlockGroup.CONTAINERS.contains(Material.ARMOR_STAND) || BlockGroup.CONTAINERS.contains(Material.ITEM_FRAME)) {
-                                for (Entity entity : block.getChunk().getEntities()) {
-                                    if (entity.getLocation().getBlockX() == rowX && entity.getLocation().getBlockY() == rowY && entity.getLocation().getBlockZ() == rowZ) {
-                                        if (entity instanceof ArmorStand) {
-                                            container = ItemUtils.getEntityEquipment((LivingEntity) entity);
-                                            containerType = Material.ARMOR_STAND;
-                                        }
-                                        else if (entity instanceof ItemFrame) {
-                                            container = entity;
-                                            containerType = Material.ITEM_FRAME;
-                                            if (faceData.length() > 0 && (BlockFace.valueOf(faceData) == ((ItemFrame) entity).getFacing())) {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            lastX = rowX;
-                            lastY = rowY;
-                            lastZ = rowZ;
-                            lastWorldId = rowWorldId;
-                            lastFace = faceData;
-                        }
-
-                        if (container != null) {
-                            int action = 0;
-                            if (rollbackType == 0 && rowAction == 0) {
-                                action = 1;
-                            }
-
-                            if (rollbackType == 1 && rowAction == 1) {
-                                action = 1;
-                            }
-
-                            int slot = (Integer) populatedStack[0];
-                            itemstack = (ItemStack) populatedStack[2];
-
-                            RollbackUtil.modifyContainerItems(containerType, container, slot, itemstack, action);
-                            counters.addItems(rowAmount);
-                        }
-                        containerInit = true;
-                    }
-                }
+            if (inventoryRollback) {
+                processInventoryRows(itemData, rollbackType, finalUserString, inventoryContext, counters);
+            }
+            else {
+                counters.addItems(replayContainerRows(bukkitRollbackWorld, null, itemData, rollbackType, finalUserString,
+                        () -> inventoryContext != null && inventoryContext.isCancelled()));
             }
             itemData.clear();
 
-            for (Entry<Player, List<Integer>> sortEntry : sortPlayers.entrySet()) {
-                RollbackItemHandler.sortContainerItems(sortEntry.getKey().getInventory(), sortEntry.getValue());
-            }
-            sortPlayers.clear();
-            if (inventoryRows != null) {
-                for (Entry<Player, List<InventoryRow>> playerRows : inventoryRows.entrySet()) {
-                    scheduleInventoryRows(inventoryContext, playerRows.getKey(), playerRows.getValue(), rollbackType);
-                }
-            }
-
-            updateRollbackHash(finalUserString, counters, 1);
-
-            // Teleport players out of danger if they're within this chunk
-            if (preview == 0) {
-                for (Player player : Bukkit.getOnlinePlayers()) {
+            if (!inventoryRollback) {
+                for (Entity entity : bukkitRollbackWorld.getChunkAt(finalChunkX, finalChunkZ).getEntities()) {
+                    if (!(entity instanceof Player)) {
+                        continue;
+                    }
+                    Player player = (Player) entity;
                     if (PaperAdapter.ADAPTER != null && !PaperAdapter.ADAPTER.isOwnedByCurrentRegion(player)) {
                         continue;
                     }
-                    Location playerLocation = player.getLocation();
-                    World playerWorld = playerLocation.getWorld();
-                    if (playerWorld == null) {
-                        continue;
-                    }
-                    int chunkX = playerLocation.getBlockX() >> 4;
-                    int chunkZ = playerLocation.getBlockZ() >> 4;
-
-                    if (bukkitRollbackWorld.getName().equals(playerWorld.getName()) && chunkX == finalChunkX && chunkZ == finalChunkZ) {
-                        Scheduler.runTask(CoreProtect.getInstance(), () -> {
-                            Location currentLocation = player.getLocation();
-                            World currentWorld = currentLocation.getWorld();
-                            if (currentWorld != null && bukkitRollbackWorld.getName().equals(currentWorld.getName())
-                                    && (currentLocation.getBlockX() >> 4) == finalChunkX
-                                    && (currentLocation.getBlockZ() >> 4) == finalChunkZ) {
-                                Teleport.performSafeTeleport(player, currentLocation, false);
-                            }
-                        }, player);
-                    }
+                    Scheduler.runTask(CoreProtect.getInstance(), () -> {
+                        Location currentLocation = player.getLocation();
+                        if (bukkitRollbackWorld.equals(currentLocation.getWorld())
+                                && (currentLocation.getBlockX() >> 4) == finalChunkX
+                                && (currentLocation.getBlockZ() >> 4) == finalChunkZ) {
+                            Teleport.performSafeTeleport(player, currentLocation, false);
+                        }
+                    }, player);
                 }
             }
 
             return true;
         }
         catch (Exception e) {
+            try {
+                chunkChanges.publishAppliedRows(finalUserString, rollbackType, counters);
+            }
+            catch (Exception publicationFailure) {
+                e.addSuppressed(publicationFailure);
+            }
             ErrorReporter.report(e);
-            updateRollbackHash(finalUserString, counters, 2);
             return false;
         }
     }
 
-    private static void updateRollbackHash(String finalUserString, RollbackCounters counters, int status) {
-        int[] rollbackHashData = ConfigHandler.rollbackHash.get(finalUserString);
-        int itemCount = rollbackHashData[0] + counters.getItems();
-        int blockCount = rollbackHashData[1] + counters.getBlocks();
-        int entityCount = rollbackHashData[2] + counters.getEntities();
-        int scannedWorlds = rollbackHashData[4] + 1;
-        ConfigHandler.rollbackHash.put(finalUserString, new int[] { itemCount, blockCount, entityCount, status, scannedWorlds });
+    private static final class ChunkBlockChanges extends LinkedHashMap<Block, PendingBlockChange> {
+        private static final long serialVersionUID = 1L;
+
+        private final Map<Block, PendingWrite> pendingWrites = new HashMap<>();
+        private final List<PendingWrite> supersededWrites = new ArrayList<>();
+        private final List<ReplayedBlockRow> rows = new ArrayList<>();
+
+        @Override
+        public PendingBlockChange remove(Object block) {
+            PendingWrite superseded = pendingWrites.remove(block);
+            if (superseded != null) {
+                supersededWrites.add(superseded);
+            }
+            return super.remove(block);
+        }
+
+        private void recordReplay(Block block, Object[] row, BlockReplayResult result, boolean publishMarker) {
+            if (result.applied()) {
+                supersededWrites.forEach(write -> write.applied = true);
+            }
+            supersededWrites.clear();
+            if (result.counted() || publishMarker) {
+                PendingWrite write = containsKey(block) ? pendingWrites.computeIfAbsent(block, key -> new PendingWrite()) : null;
+                rows.add(new ReplayedBlockRow(row, write, result.counted(), publishMarker));
+            }
+        }
+
+        private void confirmPendingWrite(Block block) {
+            PendingWrite write = pendingWrites.remove(block);
+            if (write != null) {
+                write.applied = true;
+            }
+        }
+
+        private void publishAppliedRows(String actor, int rollbackType, RollbackCounters counters) {
+            if (rows.isEmpty()) {
+                return;
+            }
+            List<Object[]> applied = new ArrayList<>();
+            for (ReplayedBlockRow replay : rows) {
+                if (replay.write != null && !replay.write.applied) {
+                    continue;
+                }
+                if (replay.counted) {
+                    counters.addBlocks(1);
+                }
+                if (replay.publishMarker) {
+                    applied.add(replay.row);
+                }
+            }
+            rows.clear();
+            if (!applied.isEmpty()) {
+                Queue.queueRollbackUpdate(actor, null, applied, Process.ROLLBACK_UPDATE, rollbackType);
+            }
+        }
     }
 
-    private static int applyInventoryRow(Player player, Object[] row, Material inventoryItem, int rollbackType) {
+    private static final class PendingWrite {
+        private boolean applied;
+    }
+
+    private static final class ReplayedBlockRow {
+        private final Object[] row;
+        private final PendingWrite write;
+        private final boolean counted;
+        private final boolean publishMarker;
+
+        private ReplayedBlockRow(Object[] row, PendingWrite write, boolean counted, boolean publishMarker) {
+            this.row = row;
+            this.write = write;
+            this.counted = counted;
+            this.publishMarker = publishMarker;
+        }
+    }
+
+    static void restoreLegacyKill(EntitySpawnRollbackHandler.Context context, World world, Object[] row) {
+        int storedTypeId = (Integer) row[6];
+        int dataId = (Integer) row[7];
+        List<Object> data = context.getLegacyKillData(dataId);
+        EntityType type = EntitySpawnTracking.resolveKillType(storedTypeId, data);
+        if (type == null || type == EntityType.UNKNOWN || context.isCancelled()) {
+            return;
+        }
+
+        Location location = new Location(world, (Integer) row[3], (Integer) row[4], (Integer) row[5]);
+        AtomicBoolean started = new AtomicBoolean();
+        CompletableFuture<Boolean> restored = EntityUtil.restoreLegacyEntity(location, type, data, storedTypeId, () -> beginDeferredMutation(context, started))
+                .thenApply(entity -> entity != null);
+        publishDeferredChange(context, started, restored, row, 0, false, true);
+    }
+
+    static boolean beginDeferredMutation(EntitySpawnRollbackHandler.Context context, AtomicBoolean started) {
+        if (!context.beginMutation()) {
+            return false;
+        }
+        started.set(true);
+        return true;
+    }
+
+    static void publishDeferredChange(EntitySpawnRollbackHandler.Context context, AtomicBoolean started, CompletableFuture<Boolean> change,
+            Object[] row, int rollbackType, boolean countBlock, boolean countEntity) {
+        CompletableFuture<Boolean> publication = change.handle((applied, error) -> {
+            try {
+                if (error != null) {
+                    context.reportFailure("Deferred rollback change did not finish", null);
+                    ErrorReporter.report(error);
+                    return false;
+                }
+                if (applied) {
+                    Queue.queueRollbackUpdate(context.actor(), null, List.<Object[]>of(row), Process.ROLLBACK_UPDATE, rollbackType);
+                    if (countBlock) {
+                        context.addBlockCount();
+                    }
+                    if (countEntity) {
+                        context.addEntityCount();
+                    }
+                }
+                return true;
+            }
+            finally {
+                if (started.get()) {
+                    context.endMutation();
+                }
+            }
+        });
+        context.addPending(publication);
+    }
+
+    public static int replayContainerRows(World world, Block inspectedBlock, List<Object[]> rows, int rollbackType, String actor, BooleanSupplier cancelled) {
+        Block block = inspectedBlock;
+        RollbackUtil.ContainerItem previousItem = null;
+        RollbackUtil.ContainerTarget target = null;
+        List<Object[]> applied = new ArrayList<>();
+        int modified = 0;
+        try {
+            for (Object[] row : rows) {
+                if (cancelled.getAsBoolean()) {
+                    break;
+                }
+                int rowAction = (Integer) row[8];
+                int rowAmount = (Integer) row[11];
+                Material material = MaterialUtils.getType((Integer) row[6]);
+                if (material == null || rowAmount <= 0 || rowAction < 0 || rowAction > 1 || MaterialUtils.rolledBack((Integer) row[9], false) != rollbackType) {
+                    continue;
+                }
+                if (inspectedBlock == null) {
+                    int x = (Integer) row[3];
+                    int y = (Integer) row[4];
+                    int z = (Integer) row[5];
+                    if (block == null || block.getX() != x || block.getY() != y || block.getZ() != z) {
+                        block = world.getBlockAt(x, y, z);
+                        previousItem = null;
+                    }
+                }
+                RollbackUtil.ContainerItem item = RollbackUtil.decodeContainerItem(new ItemStack(material, rowAmount), (byte[]) row[12]);
+                if (!item.sameTarget(previousItem)) {
+                    target = RollbackUtil.resolveContainer(block, item);
+                    if (target != null && target.container() instanceof Inventory) {
+                        InventoryChangeListener.flushPendingContainer((Inventory) target.container(), block.getLocation());
+                    }
+                    previousItem = item;
+                }
+                if (target != null) {
+                    int action = rowAction == rollbackType ? 1 : 0;
+                    ContainerReplayResult result = RollbackUtil.replayContainerItems(target.type(), target.container(), item.slot(), item.stack(), action);
+                    if (result.applied()) {
+                        applied.add(row);
+                        modified += result.modifiedAmount();
+                    }
+                }
+            }
+        }
+        finally {
+            if (!applied.isEmpty()) {
+                Queue.queueRollbackUpdate(actor, null, applied, Process.CONTAINER_ROLLBACK_UPDATE, rollbackType);
+            }
+        }
+        return modified;
+    }
+
+    private static void processInventoryRows(List<Object[]> rows, int rollbackType, String actor, EntitySpawnRollbackHandler.Context context, RollbackCounters counters) {
+        Map<Player, List<InventoryRow>> inventoryRows = new LinkedHashMap<>();
+        for (Object[] row : rows) {
+            if (MaterialUtils.rolledBack((Integer) row[9], true) != rollbackType || (Integer) row[11] <= 0) {
+                continue;
+            }
+            Material type = MaterialUtils.getType((Integer) row[6]);
+            Material inventoryItem = type == null ? null : ItemUtils.inventoryItemFilter(type, (Integer) row[14] == InventorySources.BLOCK);
+            String rowUser = ConfigHandler.playerIdCacheReversed.get((Integer) row[2]);
+            if (inventoryItem == null || rowUser == null) {
+                continue;
+            }
+
+            String uuid = ConfigHandler.uuidCache.get(rowUser.toLowerCase(Locale.ROOT));
+            Player player = uuid == null || uuid.isEmpty() ? null : Bukkit.getServer().getPlayer(UUID.fromString(uuid));
+            if (player != null) {
+                inventoryRows.computeIfAbsent(player, key -> new ArrayList<>()).add(new InventoryRow(row, inventoryItem));
+            }
+        }
+
+        for (Entry<Player, List<InventoryRow>> playerRows : inventoryRows.entrySet()) {
+            Player player = playerRows.getKey();
+            if (ConfigHandler.isFolia && context != null) {
+                scheduleInventoryRows(context, actor, player, playerRows.getValue(), rollbackType);
+            }
+            else {
+                counters.addItems(applyInventoryRows(actor, player, playerRows.getValue(), rollbackType, context));
+            }
+        }
+    }
+
+    private static int applyInventoryRows(String actor, Player player, List<InventoryRow> rows, int rollbackType, EntitySpawnRollbackHandler.Context context) {
+        if (!player.isOnline()) {
+            return 0;
+        }
+
+        List<Integer> sortSlots = new ArrayList<>();
+        List<Object[]> applied = new ArrayList<>();
+        int items = 0;
+        try {
+            for (InventoryRow inventoryRow : rows) {
+                if (context != null && context.isCancelled()) {
+                    break;
+                }
+                ContainerReplayResult result = applyInventoryRow(player, inventoryRow.row, inventoryRow.item, rollbackType);
+                if (result != null && result.applied()) {
+                    int modifiedArmor = result.modifiedArmorSlot();
+                    if (modifiedArmor > -1 && !sortSlots.contains(modifiedArmor)) {
+                        sortSlots.add(modifiedArmor);
+                    }
+                    applied.add(inventoryRow.row);
+                    items += result.modifiedAmount();
+                }
+            }
+            if (!sortSlots.isEmpty()) {
+                RollbackItemHandler.sortContainerItems(player.getInventory(), sortSlots);
+            }
+        }
+        finally {
+            publishInventoryRows(actor, applied, rollbackType);
+        }
+        return items;
+    }
+
+    private static ContainerReplayResult applyInventoryRow(Player player, Object[] row, Material inventoryItem, int rollbackType) {
         int rowAction = (Integer) row[8];
         int inventoryAction = ItemTransactionActions.getInventoryActionId(rowAction);
         int action = rollbackType == 0 ? (inventoryAction ^ 1) : inventoryAction;
         ItemStack itemstack = new ItemStack(inventoryItem, (Integer) row[11]);
-        Object[] populatedStack = RollbackItemHandler.populateItemStack(itemstack, (byte[]) row[12]);
-        if (rowAction == ItemTransactionActions.REMOVE_ENDER || rowAction == ItemTransactionActions.ADD_ENDER) {
-            RollbackUtil.modifyContainerItems(null, player.getEnderChest(), (Integer) populatedStack[0], ((ItemStack) populatedStack[2]).clone(), action ^ 1);
+        RollbackUtil.ContainerItem item = RollbackUtil.decodeContainerItem(itemstack, (byte[]) row[12]);
+        PlayerInventory inventory = player.getInventory();
+        if (rowAction != ItemTransactionActions.REMOVE_ENDER && rowAction != ItemTransactionActions.ADD_ENDER) {
+            return RollbackUtil.replayContainerItems(null, inventory, item.slot(), item.stack(), action);
         }
-        return RollbackUtil.modifyContainerItems(null, player.getInventory(), (Integer) populatedStack[0], (ItemStack) populatedStack[2], action);
+
+        Inventory ender = player.getEnderChest();
+        Inventory source = action == 1 ? ender : inventory;
+        Inventory destination = action == 1 ? inventory : ender;
+        ItemStack[] sourceContents = ItemUtils.getContainerState(source instanceof PlayerInventory ? source.getContents() : source.getStorageContents());
+        ContainerReplayResult removed = RollbackUtil.replayContainerItems(null, source, item.slot(), item.stack(), 0);
+        if (!removed.applied() || removed.modifiedAmount() == 0) {
+            return null;
+        }
+
+        ContainerReplayResult added = null;
+        try {
+            added = RollbackUtil.replayContainerItems(null, destination, item.slot(), item.stack(), 1);
+            return added;
+        }
+        finally {
+            if (added == null || !added.applied()) {
+                if (source instanceof PlayerInventory) {
+                    source.setContents(sourceContents);
+                }
+                else {
+                    source.setStorageContents(sourceContents);
+                }
+            }
+        }
     }
 
-    private static void scheduleInventoryRows(EntitySpawnRollbackHandler.Context context, Player player, List<InventoryRow> rows, int rollbackType) {
+    private static void publishInventoryRows(String actor, List<Object[]> rows, int rollbackType) {
+        Map<Integer, List<Object[]>> updates = new LinkedHashMap<>();
+        for (Object[] row : rows) {
+            updates.computeIfAbsent((Integer) row[14], key -> new ArrayList<>()).add(row);
+        }
+        for (Entry<Integer, List<Object[]>> update : updates.entrySet()) {
+            int target = update.getKey();
+            if (target == InventorySources.ENTITY_CONTAINER) {
+                Queue.queueEntityContainerRollbackUpdate(actor, (Location) null, update.getValue(), rollbackType, true);
+                continue;
+            }
+            int process;
+            if (target == RollbackUpdateTargets.INVENTORY_ITEM) {
+                process = Process.INVENTORY_ROLLBACK_UPDATE;
+            }
+            else if (target == RollbackUpdateTargets.CONTAINER) {
+                process = Process.INVENTORY_CONTAINER_ROLLBACK_UPDATE;
+            }
+            else {
+                process = Process.BLOCK_INVENTORY_ROLLBACK_UPDATE;
+            }
+            Queue.queueRollbackUpdate(actor, null, update.getValue(), process, rollbackType);
+        }
+    }
+
+    private static void scheduleInventoryRows(EntitySpawnRollbackHandler.Context context, String actor, Player player, List<InventoryRow> rows, int rollbackType) {
         CompletableFuture<Boolean> completion = new CompletableFuture<>();
         Runnable task = () -> {
             // Nothing is changed once the rollback is cancelled, and cleanup waits for a started mutation to finish
@@ -459,30 +620,18 @@ public class RollbackProcessor {
                 return;
             }
 
-            int items = 0;
+            boolean succeeded = false;
             try {
-                List<Integer> sortSlots = new ArrayList<>();
-                for (InventoryRow inventoryRow : rows) {
-                    int modifiedArmor = applyInventoryRow(player, inventoryRow.row, inventoryRow.item, rollbackType);
-                    if (modifiedArmor > -1 && !sortSlots.contains(modifiedArmor)) {
-                        sortSlots.add(modifiedArmor);
-                    }
-                    items += (Integer) inventoryRow.row[11];
-                }
-                if (!sortSlots.isEmpty()) {
-                    RollbackItemHandler.sortContainerItems(player.getInventory(), sortSlots);
-                }
-                context.addItemCount(items);
-                completion.complete(true);
+                context.addItemCount(applyInventoryRows(actor, player, rows, rollbackType, context));
+                succeeded = true;
             }
             catch (Exception e) {
                 context.cancel();
                 ErrorReporter.report(e);
-                context.addItemCount(items);
-                completion.complete(false);
             }
             finally {
                 context.endMutation();
+                completion.complete(succeeded);
             }
         };
 

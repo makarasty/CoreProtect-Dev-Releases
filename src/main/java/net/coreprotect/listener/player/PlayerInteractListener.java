@@ -1,10 +1,8 @@
 package net.coreprotect.listener.player;
 
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.EnumSet;
-import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.bukkit.GameMode;
@@ -25,6 +23,7 @@ import org.bukkit.block.data.Waterlogged;
 import org.bukkit.block.data.type.Bed;
 import org.bukkit.block.data.type.Bed.Part;
 import org.bukkit.block.data.type.Cake;
+import org.bukkit.block.data.type.TurtleEgg;
 import org.bukkit.entity.EnderCrystal;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
@@ -56,21 +55,64 @@ import net.coreprotect.model.action.SignActions;
 import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.thread.CacheHandler;
 import net.coreprotect.thread.Scheduler;
+import net.coreprotect.utility.BlockUtils;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.Color;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.WorldUtils;
 import net.coreprotect.utility.ErrorReporter;
 
-public final class PlayerInteractListener extends Queue implements Listener {
+public final class PlayerInteractListener implements Listener {
 
-    public static ConcurrentHashMap<String, Object[]> lastInspectorEvent = new ConcurrentHashMap<>();
-    public static ConcurrentHashMap<String, Object[]> suspiciousBlockEvent = new ConcurrentHashMap<>();
+    private static final Set<Material> SIGN_DYES = EnumSet.of(Material.BLACK_DYE, Material.BLUE_DYE, Material.BROWN_DYE, Material.CYAN_DYE,
+            Material.GRAY_DYE, Material.GREEN_DYE, Material.LIGHT_BLUE_DYE, Material.LIGHT_GRAY_DYE, Material.LIME_DYE,
+            Material.MAGENTA_DYE, Material.ORANGE_DYE, Material.PINK_DYE, Material.PURPLE_DYE, Material.RED_DYE, Material.WHITE_DYE, Material.YELLOW_DYE);
+    private static final Set<Material> ENTITY_LAUNCH_ITEMS = EnumSet.of(Material.ARMOR_STAND, Material.END_CRYSTAL, Material.BOW, Material.CROSSBOW, Material.TRIDENT,
+            Material.EXPERIENCE_BOTTLE, Material.SPLASH_POTION, Material.LINGERING_POTION, Material.ENDER_PEARL, Material.FIREWORK_ROCKET, Material.EGG, Material.SNOWBALL);
+
+    static {
+        for (String name : new String[] { "WIND_CHARGE", "BLUE_EGG", "BROWN_EGG" }) {
+            Material material = Material.getMaterial(name);
+            if (material != null) {
+                ENTITY_LAUNCH_ITEMS.add(material);
+            }
+        }
+    }
+
+    public static final ConcurrentHashMap<String, Object[]> lastInspectorEvent = new ConcurrentHashMap<>();
 
     private final BlockInspector blockInspector = new BlockInspector();
     private final SignInspector signInspector = new SignInspector();
     private final ContainerInspector containerInspector = new ContainerInspector();
     private final InteractionInspector interactionInspector = new InteractionInspector();
+
+    public static void clearInspectorEvent(UUID playerId) {
+        lastInspectorEvent.remove(playerId.toString());
+    }
+
+    public static void clearExpiredInspectorEvents(long now) {
+        lastInspectorEvent.values().removeIf(event -> now - (long) event[0] > 1000L);
+    }
+
+    static boolean hasInspectPermission(Player player) {
+        if (player.hasPermission("coreprotect.inspect")) {
+            return true;
+        }
+        Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
+        ConfigHandler.inspecting.put(player.getName(), false);
+        return false;
+    }
+
+    static boolean beginEntityInspection(Player player, EquipmentSlot hand) {
+        String id = player.getUniqueId().toString();
+        long now = System.currentTimeMillis();
+        Object[] previous = lastInspectorEvent.get(id);
+        if (previous != null && now - (long) previous[0] < 100L) {
+            return false;
+        }
+        lastInspectorEvent.put(id, new Object[] { now, hand });
+        return hasInspectPermission(player);
+    }
 
     private static boolean shouldInspect(PlayerInteractEvent event) {
         EquipmentSlot eventHand = event.getHand();
@@ -91,11 +133,11 @@ public final class PlayerInteractListener extends Queue implements Listener {
         return true;
     }
 
-    private static boolean containsItem(ItemStack itemStack) {
+    static boolean containsItem(ItemStack itemStack) {
         return itemStack != null && itemStack.getType() != Material.AIR;
     }
 
-    private static ItemStack getHandItem(Player player, EquipmentSlot hand) {
+    static ItemStack getHandItem(Player player, EquipmentSlot hand) {
         if (hand == EquipmentSlot.HAND) {
             return player.getInventory().getItemInMainHand();
         }
@@ -141,17 +183,13 @@ public final class PlayerInteractListener extends Queue implements Listener {
             return;
         }
 
-        if (!player.hasPermission("coreprotect.inspect")) {
-            Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
-            ConfigHandler.inspecting.put(player.getName(), false);
+        if (!hasInspectPermission(player)) {
             return;
         }
 
         if (event.getAction().equals(Action.LEFT_CLICK_BLOCK)) {
             BlockState checkBlock = event.getClickedBlock().getState();
-            int x = checkBlock.getX();
             int y = checkBlock.getY();
-            int z = checkBlock.getZ();
 
             /* Check if clicking top half of double plant */
             BlockData checkBlockData = checkBlock.getBlockData();
@@ -174,19 +212,7 @@ public final class PlayerInteractListener extends Queue implements Listener {
                 PlayerInteractUtils.handleBisectedBlockVisualization(player, event.getClickedBlock(), world);
             }
             else {
-                Block block = event.getClickedBlock();
-                int blockX = block.getX();
-                int blockY = block.getY();
-                int blockZ = block.getZ();
-
-                Block x1 = world.getBlockAt(blockX + 1, blockY, blockZ);
-                Block x2 = world.getBlockAt(blockX - 1, blockY, blockZ);
-                Block z1 = world.getBlockAt(blockX, blockY, blockZ + 1);
-                Block z2 = world.getBlockAt(blockX, blockY, blockZ - 1);
-                player.sendBlockChange(x1.getLocation(), x1.getBlockData());
-                player.sendBlockChange(x2.getLocation(), x2.getBlockData());
-                player.sendBlockChange(z1.getLocation(), z1.getBlockData());
-                player.sendBlockChange(z2.getLocation(), z2.getBlockData());
+                PlayerInteractUtils.refreshHorizontalNeighbors(player, event.getClickedBlock(), world);
             }
 
             event.setCancelled(true);
@@ -320,20 +346,15 @@ public final class PlayerInteractListener extends Queue implements Listener {
                     boolean isCake = false;
 
                     if (BukkitAdapter.ADAPTER.isSign(type)) {
-                        // check if right clicked sign with dye
-                        Set<Material> dyeSet = EnumSet.of(Material.BLACK_DYE, Material.BLUE_DYE, Material.BROWN_DYE, Material.CYAN_DYE, Material.GRAY_DYE, Material.GREEN_DYE, Material.LIGHT_BLUE_DYE, Material.LIGHT_GRAY_DYE, Material.LIME_DYE, Material.MAGENTA_DYE, Material.ORANGE_DYE, Material.PINK_DYE, Material.PURPLE_DYE, Material.RED_DYE, Material.WHITE_DYE, Material.YELLOW_DYE);
-                        Material handType = null;
-
-                        ItemStack mainHand = player.getInventory().getItemInMainHand();
-                        if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null) {
-                            handType = mainHand.getType();
-                        }
-
-                        if (handType != null && (dyeSet.contains(handType) || handType.name().endsWith("INK_SAC") || handType == Material.HONEYCOMB) && Config.getConfig(block.getWorld()).SIGN_TEXT) {
+                        ItemStack hand = getHandItem(player, event.getHand());
+                        Material handType = containsItem(hand) ? hand.getType() : null;
+                        Config config = Config.getConfig(world);
+                        if (handType != null && config.SIGN_TEXT
+                                && (SIGN_DYES.contains(handType) || handType.name().endsWith("INK_SAC") || handType == Material.HONEYCOMB)) {
                             BlockState blockState = block.getState();
                             Sign sign = (Sign) blockState;
                             SignState oldSign = SignState.capture(sign);
-                            boolean changingColor = dyeSet.contains(handType);
+                            boolean changingColor = SIGN_DYES.contains(handType);
                             boolean changingGlow = handType.name().endsWith("INK_SAC");
                             Boolean interactionFront = PaperAdapter.ADAPTER.getSignInteractionSide(sign, player);
 
@@ -363,7 +384,9 @@ public final class PlayerInteractListener extends Queue implements Listener {
                                                 changingColor || changingGlow ? after.isWaxed() : oldSign.isWaxed());
                                         Location location = blockState.getLocation();
                                         Queue.queueSignText(player.getName(), location, SignActions.BEFORE, before, modifyingFront, 1);
-                                        Queue.queueBlockPlace(player.getName(), blockState, block.getType(), blockState, block.getType(), -1, 0, blockState.getBlockData().getAsString());
+                                        if (config.BLOCK_PLACE) {
+                                            Queue.queueBlockPlace(player.getName(), blockState, blockState.getType(), blockState, blockState.getType(), -1, 0, blockState.getBlockData().getAsString());
+                                        }
                                         Queue.queueSignText(player.getName(), location, SignActions.EDIT, after, modifyingFront, 0);
                                     }
                                 }, block.getLocation());
@@ -371,7 +394,7 @@ public final class PlayerInteractListener extends Queue implements Listener {
                         }
                     }
                     else if (BlockGroup.INTERACT_BLOCKS.contains(type)) {
-                        if (event.getHand().equals(EquipmentSlot.HAND) && Config.getConfig(world).PLAYER_INTERACTIONS) {
+                        if (event.getHand() == EquipmentSlot.HAND && Config.getConfig(world).PLAYER_INTERACTIONS) {
                             Block interactBlock = event.getClickedBlock();
                             if (BlockGroup.DOORS.contains(type)) {
                                 int y = interactBlock.getY() - 1;
@@ -385,93 +408,57 @@ public final class PlayerInteractListener extends Queue implements Listener {
                             Queue.queuePlayerInteraction(player.getName(), interactBlock.getLocation(), type, interactBlock.getBlockData().getAsString());
                         }
                     }
-                    else if (BlockGroup.LIGHTABLES.contains(type)) { // extinguishing a lit block such as a campfire
+                    else if (BlockGroup.LIGHTABLES.contains(type)) {
                         BlockData blockData = block.getBlockData();
-                        if (blockData instanceof Lightable && ((Lightable) blockData).isLit() && ((BlockGroup.CANDLES.contains(type) && event.getMaterial() == Material.AIR) || (!BlockGroup.CANDLES.contains(type) && event.getMaterial().name().endsWith("_SHOVEL")))) {
-                            ((Lightable) blockData).setLit(false);
-                            Queue.queueBlockPlace(player.getName(), block.getState(), type, block.getState(), type, -1, 0, blockData.getAsString());
-
-                            /*
-                            BlockState blockState = block.getState();
-                            Bukkit.getServer().getScheduler().runTask(CoreProtect.getInstance(), () -> {
-                                try {
-                                    BlockData validateBlockData = block.getBlockData();
-                                    if (validateBlockData instanceof Lightable && !((Lightable) validateBlockData).isLit()) {
-                                        Queue.queueBlockPlace(player.getName(), blockState, type, blockState, type, -1, 0, validateBlockData.getAsString());
+                        ItemStack hand = getHandItem(player, event.getHand());
+                        boolean candle = BlockGroup.CANDLES.contains(type);
+                        boolean usableHand = event.getHand() == EquipmentSlot.HAND || event.getHand() == EquipmentSlot.OFF_HAND;
+                        boolean extinguishing = usableHand && (candle ? !containsItem(hand) : containsItem(hand) && hand.getType().name().endsWith("_SHOVEL"));
+                        if (extinguishing && blockData instanceof Lightable && ((Lightable) blockData).isLit()) {
+                            if (Config.getConfig(world).BLOCK_PLACE) {
+                                BlockState before = block.getState();
+                                String user = player.getName();
+                                Scheduler.runTask(CoreProtect.getInstance(), () -> {
+                                    BlockState after = block.getState();
+                                    BlockData afterData = after.getBlockData();
+                                    if (after.getType() == type && afterData instanceof Lightable && !((Lightable) afterData).isLit()) {
+                                        Queue.queueBlockPlace(user, before, type, before, type, -1, 0, afterData.getAsString());
                                     }
-                                }
-                                catch (Exception e) {
-                                    ErrorReporter.report(e);
-                                }
-                            });
-                            */
-                        }
-                        else if (CampfireStartListener.useCampfireStartEvent && (type == Material.CAMPFIRE || type == Material.SOUL_CAMPFIRE)) {
-                            ItemStack handItem = null;
-                            ItemStack mainHand = player.getInventory().getItemInMainHand();
-                            ItemStack offHand = player.getInventory().getItemInOffHand();
-
-                            if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null && mainHand.getType() != Material.BUCKET) {
-                                handItem = mainHand;
-                            }
-                            else if (event.getHand().equals(EquipmentSlot.OFF_HAND) && offHand != null) {
-                                handItem = offHand;
-                            }
-                            else {
-                                return;
-                            }
-
-                            if (player.getGameMode() != GameMode.CREATIVE) {
-                                Location location = block.getLocation();
-                                long time = System.currentTimeMillis();
-                                int wid = WorldUtils.getWorldId(location.getWorld().getName());
-                                int x = location.getBlockX();
-                                int y = location.getBlockY();
-                                int z = location.getBlockZ();
-                                String coordinates = x + "." + y + "." + z + "." + wid + "." + type.name();
-                                CacheHandler.interactCache.put(coordinates, new Object[] { time, handItem.clone(), player.getName() });
+                                }, before.getLocation());
                             }
                         }
+                        else if (CampfireStartListener.useCampfireStartEvent && (type == Material.CAMPFIRE || type == Material.SOUL_CAMPFIRE)
+                                && containsItem(hand) && hand.getType() != Material.BUCKET && player.getGameMode() != GameMode.CREATIVE) {
+                            Location location = block.getLocation();
+                            int wid = WorldUtils.getWorldId(world.getName());
+                            String coordinates = location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ() + "." + wid + "." + type.name();
+                            CacheHandler.interactCache.put(coordinates, new Object[] { System.currentTimeMillis(), hand.clone(), player.getName() });
+                        }
 
-                        isCake = type.name().endsWith(Material.CAKE.name());
+                        isCake = type.name().endsWith("_CANDLE_CAKE");
                     }
                     else if (type == Material.JUKEBOX) {
                         BlockState blockState = block.getState();
                         if (blockState instanceof Jukebox) {
-                            Jukebox jukebox = (Jukebox) blockState;
-                            ItemStack jukeboxRecord = jukebox.isPlaying() ? jukebox.getRecord() : new ItemStack(Material.AIR);
-                            ItemStack oldItemState = jukeboxRecord.clone();
-                            ItemStack newItemState = new ItemStack(Material.AIR);
-
-                            if (jukeboxRecord.getType() == Material.AIR) {
-                                ItemStack handItem = null;
-                                ItemStack mainHand = player.getInventory().getItemInMainHand();
-                                ItemStack offHand = player.getInventory().getItemInOffHand();
-
-                                if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null && mainHand.getType().name().startsWith("MUSIC_DISC")) {
-                                    handItem = mainHand;
+                            ItemStack record = ((Jukebox) blockState).getRecord();
+                            boolean ejecting = containsItem(record);
+                            ItemStack hand = getHandItem(player, event.getHand());
+                            boolean inserting = !ejecting && event.useItemInHand() != Event.Result.DENY && containsItem(hand) && hand.getType().name().startsWith("MUSIC_DISC_");
+                            if (ejecting || inserting) {
+                                Config config = Config.getConfig(world);
+                                String user = player.getName();
+                                Location location = blockState.getLocation();
+                                if (config.PLAYER_INTERACTIONS) {
+                                    Queue.queuePlayerInteraction(user, location, type, blockState.getBlockData().getAsString());
                                 }
-                                else if (event.getHand().equals(EquipmentSlot.OFF_HAND) && offHand != null && offHand.getType().name().startsWith("MUSIC_DISC")) {
-                                    handItem = offHand;
-                                }
-                                else {
-                                    return;
-                                }
-
-                                oldItemState = new ItemStack(Material.AIR);
-                                newItemState = handItem.clone();
-                            }
-
-                            if (!oldItemState.equals(newItemState)) {
-                                if (Config.getConfig(player.getWorld()).PLAYER_INTERACTIONS) {
-                                    Queue.queuePlayerInteraction(player.getName(), blockState.getLocation(), type, blockState.getBlockData().getAsString());
-                                }
-
-                                if (Config.getConfig(block.getWorld()).ITEM_TRANSACTIONS) {
-                                    boolean logDrops = player.getGameMode() != GameMode.CREATIVE;
-                                    ItemStack[] oldState = new ItemStack[] { oldItemState };
-                                    ItemStack[] newState = new ItemStack[] { newItemState };
-                                    PlayerInteractEntityListener.queueContainerSpecifiedItems(player.getName(), Material.JUKEBOX, new Object[] { oldState, newState }, jukebox.getLocation(), logDrops);
+                                if (config.ITEM_TRANSACTIONS) {
+                                    ItemStack before = ejecting ? record.clone() : new ItemStack(Material.AIR);
+                                    ItemStack after = inserting ? hand.clone() : new ItemStack(Material.AIR);
+                                    if (inserting) {
+                                        after.setAmount(1);
+                                    }
+                                    PlayerInteractEntityListener.queueContainerSpecifiedItems(user, Material.JUKEBOX,
+                                            new Object[] { new ItemStack[] { before }, new ItemStack[] { after } }, location, ejecting);
                                 }
                             }
                         }
@@ -499,17 +486,8 @@ public final class PlayerInteractListener extends Queue implements Listener {
                                 ItemStack newItemState = new ItemStack(Material.AIR);
 
                                 if (book.getType() == Material.AIR) {
-                                    ItemStack handItem = null;
-                                    ItemStack mainHand = player.getInventory().getItemInMainHand();
-                                    ItemStack offHand = player.getInventory().getItemInOffHand();
-
-                                    if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null && BukkitAdapter.ADAPTER.isBookshelfBook(mainHand.getType())) {
-                                        handItem = mainHand;
-                                    }
-                                    else if (event.getHand().equals(EquipmentSlot.OFF_HAND) && offHand != null && BukkitAdapter.ADAPTER.isBookshelfBook(offHand.getType())) {
-                                        handItem = offHand;
-                                    }
-                                    else {
+                                    ItemStack handItem = getHandItem(player, event.getHand());
+                                    if (!containsItem(handItem) || !BukkitAdapter.ADAPTER.isBookshelfBook(handItem.getType())) {
                                         return;
                                     }
 
@@ -538,105 +516,45 @@ public final class PlayerInteractListener extends Queue implements Listener {
                         BlockState blockState = block.getState();
                         InventoryChangeListener.inventoryTransaction(player.getName(), blockState.getLocation(), null);
                     }
-                    else if (BukkitAdapter.ADAPTER.isSuspiciousBlock(type)) {
-                        ItemStack handItem = null;
-                        ItemStack mainHand = player.getInventory().getItemInMainHand();
-                        ItemStack offHand = player.getInventory().getItemInOffHand();
-                        if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null) {
-                            handItem = mainHand;
-                        }
-                        else if (event.getHand().equals(EquipmentSlot.OFF_HAND) && offHand != null) {
-                            handItem = offHand;
-                        }
-
-                        if (handItem.getType() == Material.BRUSH) {
-                            BlockState blockState = block.getState();
-                            Location blockLocation = block.getLocation();
-                            Scheduler.scheduleSyncDelayedTask(CoreProtect.getInstance(), () -> {
-                                Material newType = block.getType();
-                                if (type == newType || (newType != Material.SAND && newType != Material.GRAVEL)) {
-                                    return;
-                                }
-
-                                long systemTime = System.currentTimeMillis();
-                                boolean logChange = true;
-                                if (suspiciousBlockEvent.get(player.getName()) != null) {
-                                    Object[] lastEvent = suspiciousBlockEvent.get(player.getName());
-                                    long lastTime = (long) lastEvent[0];
-                                    long timeSince = systemTime - lastTime;
-                                    Location lastLocation = (Location) lastEvent[1];
-                                    if (timeSince < 5000 && blockLocation.equals(lastLocation)) {
-                                        logChange = false;
-                                    }
-                                }
-
-                                if (logChange) {
-                                    Queue.queueBlockPlace(player.getName(), blockState, newType, blockState, newType, -1, 0, null);
-                                    suspiciousBlockEvent.put(player.getName(), new Object[] { systemTime, blockLocation });
-                                }
-                            }, blockLocation, 100);
-                        }
-                    }
                     else if (type == Material.DRAGON_EGG) {
                         PlayerInteractUtils.clickedDragonEgg(player, block);
                     }
 
                     if (isCake || type == Material.CAKE) {
                         boolean placeCandle = false;
-                        if (type == Material.CAKE) { // check if placing a candle on a cake
-                            Material handType = null;
-                            ItemStack mainHand = player.getInventory().getItemInMainHand();
-                            if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null) {
-                                handType = mainHand.getType();
-                            }
-
-                            if (handType != null && BlockGroup.CANDLES.contains(handType) && Config.getConfig(block.getWorld()).BLOCK_PLACE) {
-                                BlockState blockState = block.getState();
-                                BlockData blockData = blockState.getBlockData();
-                                Material newMaterial = Material.getMaterial(handType.name() + "_" + Material.CAKE.name());
-                                if (newMaterial != null && ((Cake) blockData).getBites() == 0) {
-                                    Queue.queueBlockPlace(player.getName(), block.getState(), block.getType(), blockState, newMaterial, -1, 0, blockData.getAsString());
+                        if (type == Material.CAKE && event.useItemInHand() != Event.Result.DENY) {
+                            ItemStack hand = getHandItem(player, event.getHand());
+                            if (containsItem(hand) && BlockGroup.CANDLES.contains(hand.getType())) {
+                                BlockState before = block.getState();
+                                Material expected = Material.getMaterial(hand.getType().name() + "_CAKE");
+                                if (expected != null && before.getBlockData() instanceof Cake && ((Cake) before.getBlockData()).getBites() == 0) {
                                     placeCandle = true;
+                                    if (Config.getConfig(world).BLOCK_PLACE) {
+                                        String user = player.getName();
+                                        Scheduler.runTask(CoreProtect.getInstance(), () -> {
+                                            BlockState after = block.getState();
+                                            if (after.getType() == expected) {
+                                                Queue.queueBlockPlace(user, before, type, before, expected, -1, 0, after.getBlockData().getAsString());
+                                            }
+                                        }, before.getLocation());
+                                    }
                                 }
                             }
                         }
 
                         if (!placeCandle) {
-                            String userUUID = player.getUniqueId().toString();
-                            Location location = player.getLocation();
-                            long time = System.currentTimeMillis();
-                            int wid = WorldUtils.getWorldId(location.getWorld().getName());
-                            int x = location.getBlockX();
-                            int y = location.getBlockY();
-                            int z = location.getBlockZ();
-                            String coordinates = x + "." + y + "." + z + "." + wid + "." + userUUID;
-                            CacheHandler.interactCache.put(coordinates, new Object[] { time, Material.CAKE, block.getState() });
+                            Config config = Config.getConfig(world);
+                            if (config.BLOCK_BREAK || config.BLOCK_PLACE) {
+                                FoodLevelChangeListener.recordCakeUse(player, block.getState());
+                            }
                         }
                     }
                 }
             }
 
             if (event.useItemInHand() != Event.Result.DENY) {
-                List<Material> entityBlockTypes = new ArrayList<>(Arrays.asList(Material.ARMOR_STAND, Material.END_CRYSTAL, Material.BOW, Material.CROSSBOW, Material.TRIDENT, Material.EXPERIENCE_BOTTLE, Material.SPLASH_POTION, Material.LINGERING_POTION, Material.ENDER_PEARL, Material.FIREWORK_ROCKET, Material.EGG, Material.SNOWBALL));
-                try {
-                    entityBlockTypes.add(Material.valueOf("WIND_CHARGE"));
-                    entityBlockTypes.add(Material.valueOf("BLUE_EGG"));
-                    entityBlockTypes.add(Material.valueOf("BROWN_EGG"));
-                }
-                catch (Exception e) {
-                    // not running MC 1.21+
-                }
-                ItemStack handItem = null;
-                ItemStack mainHand = player.getInventory().getItemInMainHand();
-                ItemStack offHand = player.getInventory().getItemInOffHand();
-
-                if (event.getHand().equals(EquipmentSlot.HAND) && mainHand != null && entityBlockTypes.contains(mainHand.getType())) {
-                    handItem = mainHand;
-                }
-                else if (event.getHand().equals(EquipmentSlot.OFF_HAND) && offHand != null && entityBlockTypes.contains(offHand.getType())) {
-                    handItem = offHand;
-                }
-                else {
+                ItemStack handItem = getHandItem(player, event.getHand());
+                if (!containsItem(handItem) || !ENTITY_LAUNCH_ITEMS.contains(handItem.getType())) {
                     return;
                 }
 
@@ -686,10 +604,10 @@ public final class PlayerInteractListener extends Queue implements Listener {
                     Location blockLocation = relativeBlockLocation.clone();
                     blockLocation.setY(blockLocation.getY() + 1);
 
-                    if (handItem.getType() == Material.ARMOR_STAND || handItem.getType() == Material.FIREWORK_ROCKET) {
-                        if (block == null) {
-                            return;
-                        }
+                    if (handItem.getType() == Material.ARMOR_STAND && block == null) {
+                        return;
+                    }
+                    if (block != null && (handItem.getType() == Material.ARMOR_STAND || handItem.getType() == Material.FIREWORK_ROCKET)) {
 
                         Block relativeBlock = block.getRelative(event.getBlockFace());
                         relativeBlockLocation = relativeBlock.getLocation();
@@ -698,32 +616,38 @@ public final class PlayerInteractListener extends Queue implements Listener {
 
                     String relativeBlockKey = world.getName() + "-" + relativeBlockLocation.getBlockX() + "-" + relativeBlockLocation.getBlockY() + "-" + relativeBlockLocation.getBlockZ();
                     String blockKey = world.getName() + "-" + blockLocation.getBlockX() + "-" + blockLocation.getBlockY() + "-" + blockLocation.getBlockZ();
-                    Object[] keys = new Object[] { System.currentTimeMillis(), relativeBlockKey, blockKey, handItem };
+                    Object[] keys = new Object[] { System.currentTimeMillis(), relativeBlockKey, blockKey, handItem.clone(), world.getUID() };
                     ConfigHandler.entityBlockMapper.put(player.getName(), keys);
                 }
             }
         }
-        else if (event.getAction().equals(Action.PHYSICAL)) {
+        else if (event.getAction() == Action.PHYSICAL && event.useInteractedBlock() != Event.Result.DENY) {
             Block block = event.getClickedBlock();
-            if (block == null || (!block.getType().equals(Material.FARMLAND) && !block.getType().equals(Material.TURTLE_EGG))) {
-                return;
-            }
-
-            World world = block.getWorld();
-            if (event.useInteractedBlock() != Event.Result.DENY && Config.getConfig(world).BLOCK_BREAK) {
-                Player player = event.getPlayer();
-                if (block.getType().equals(Material.FARMLAND)) {
-                    Block blockAbove = world.getBlockAt(block.getX(), block.getY() + 1, block.getZ());
-                    Material type = blockAbove.getType();
-
-                    if (!type.equals(Material.AIR) && !type.equals(Material.CAVE_AIR)) {
-                        /* Trampled crops, such as wheat */
-                        Queue.queueBlockBreak(player.getName(), blockAbove.getState(), type, blockAbove.getBlockData().getAsString(), 0);
-                    }
+            if (block != null && block.getType() == Material.TURTLE_EGG) {
+                Config config = Config.getConfig(block.getWorld());
+                if (!config.BLOCK_BREAK && !config.BLOCK_PLACE) {
+                    return;
                 }
-
-                Queue.queueBlockBreak(player.getName(), block.getState(), block.getType(), block.getBlockData().getAsString(), 0);
-                Queue.queueBlockPlaceDelayed(player.getName(), block.getLocation(), block.getType(), null, null, 0);
+                BlockState before = block.getState();
+                if (!(before.getBlockData() instanceof TurtleEgg)) {
+                    return;
+                }
+                int eggs = ((TurtleEgg) before.getBlockData()).getEggs();
+                String user = event.getPlayer().getName();
+                Scheduler.runTask(CoreProtect.getInstance(), () -> {
+                    BlockState after = block.getState();
+                    BlockData afterData = after.getBlockData();
+                    boolean removedLast = eggs == 1 && BlockUtils.isAir(after.getType());
+                    boolean lostOne = afterData instanceof TurtleEgg && ((TurtleEgg) afterData).getEggs() == eggs - 1;
+                    if (removedLast || lostOne) {
+                        if (config.BLOCK_BREAK) {
+                            Queue.queueBlockBreak(user, before, Material.TURTLE_EGG, before.getBlockData().getAsString(), 0);
+                        }
+                        if (config.BLOCK_PLACE && lostOne) {
+                            Queue.queueBlockPlace(user, after, after.getType(), null, null, -1, 0, afterData.getAsString());
+                        }
+                    }
+                }, before.getLocation());
             }
         }
     }

@@ -1,15 +1,12 @@
 package net.coreprotect.database.logger;
 
 import java.util.List;
-import java.util.Locale;
+import java.util.function.IntSupplier;
 
-import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
 
-import net.coreprotect.CoreProtect;
 import net.coreprotect.bukkit.BukkitAdapter;
-import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.ConsumerWriteBatch;
@@ -29,8 +26,15 @@ public class BlockBreakLogger {
     }
 
     public static void log(ConsumerWriteBatch preparedStmt, int batchCount, String user, Location location, int type, int data, List<Object> meta, String blockData, String overrideData) {
+        log(preparedStmt, batchCount, user, location, MaterialUtils.getType(type), type, () -> data, meta, blockData, overrideData);
+    }
+
+    public static void log(ConsumerWriteBatch preparedStmt, int batchCount, String user, Location location, Material type, int data, List<Object> meta, String blockData, String overrideData) {
+        log(preparedStmt, batchCount, user, location, type, 0, () -> data, meta, blockData, overrideData);
+    }
+
+    static void log(ConsumerWriteBatch preparedStmt, int batchCount, String user, Location location, Material checkType, int type, IntSupplier data, List<Object> meta, String blockData, String overrideData) {
         try {
-            Material checkType = MaterialUtils.getType(type);
             String blockKey = BlockTypeUtils.getBlockDataKey(blockData);
             if (blockKey.length() == 0 && checkType != null) {
                 blockKey = checkType.getKey().toString();
@@ -57,11 +61,6 @@ public class BlockBreakLogger {
                 return;
             }
 
-            if (!user.startsWith("#")) {
-                String cacheId = location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ() + "." + WorldUtils.getWorldId(location.getWorld().getName());
-                CacheHandler.spreadCache.remove(cacheId);
-            }
-
             if (checkType == Material.LECTERN && blockData != null) {
                 blockData = blockData.replace("has_book=true", "has_book=false");
             }
@@ -69,11 +68,16 @@ public class BlockBreakLogger {
                 blockData = overrideData;
             }
 
-            CoreProtectPreLogEvent event = new CoreProtectPreLogEvent(user, location, CoreProtectPreLogEvent.Action.BLOCK_BREAK, LookupActions.BLOCK_BREAK, checkType, null, null);
-            if (Config.getGlobal().API_ENABLED && !Bukkit.isPrimaryThread()) {
-                CoreProtect.getInstance().getServer().getPluginManager().callEvent(event);
+            CoreProtectPreLogEvent event = LoggerPreLog.fire(user, location, CoreProtectPreLogEvent.Action.BLOCK_BREAK, LookupActions.BLOCK_BREAK, checkType, null, null);
+            if (event == null || ConfigHandler.isFilterBlacklisted(event.getUser(), blockKey)) {
+                return;
             }
 
+            int effectiveData = data.getAsInt();
+            if (!user.startsWith("#")) {
+                String cacheId = location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ() + "." + WorldUtils.getWorldId(location.getWorld().getName());
+                CacheHandler.spreadCache.remove(cacheId);
+            }
             int userId = UserStatement.getId(preparedStmt, event.getUser(), true);
             Location eventLocation = event.getLocation();
             int wid = WorldUtils.getWorldId(eventLocation.getWorld().getName());
@@ -81,14 +85,10 @@ public class BlockBreakLogger {
             int x = eventLocation.getBlockX();
             int y = eventLocation.getBlockY();
             int z = eventLocation.getBlockZ();
-            CacheHandler.breakCache.put("" + x + "." + y + "." + z + "." + wid + "", new Object[] { time, event.getUser(), type });
-
-            if (event.isCancelled()) {
-                return;
-            }
-
             int internalType = blockKey.length() > 0 ? MaterialUtils.getBlockId(blockKey, true) : type;
-            BlockStatement.insert(preparedStmt, batchCount, time, userId, wid, x, y, z, internalType, data, meta, blockData, LookupActions.BLOCK_BREAK, 0);
+            CacheHandler.breakCache.put(x + "." + y + "." + z + "." + wid, new Object[] { time, event.getUser(), internalType });
+
+            BlockStatement.insert(preparedStmt, batchCount, time, userId, wid, x, y, z, internalType, effectiveData, meta, blockData, LookupActions.BLOCK_BREAK, 0);
         }
         catch (Exception e) {
             Database.handleWriteFailure(e);

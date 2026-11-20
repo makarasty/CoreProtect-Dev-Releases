@@ -33,15 +33,20 @@ final class ClickHouseWriterRegistration implements AutoCloseable {
         }
         try {
             Files.createDirectories(writerFile.toAbsolutePath().getParent());
-            writerChannel = FileChannel.open(writerFile, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            FileChannel channel = FileChannel.open(writerFile, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
             try {
-                writerLock = writerChannel.tryLock();
+                FileLock lock = tryLock(channel);
+                writerChannel = channel;
+                writerLock = lock;
             }
-            catch (OverlappingFileLockException exception) {
-                throw new SQLException("This CoreProtect installation already has an active ClickHouse writer", exception);
-            }
-            if (writerLock == null) {
-                throw new SQLException("This CoreProtect installation already has an active ClickHouse writer");
+            catch (IOException | SQLException | RuntimeException | Error failure) {
+                try {
+                    channel.close();
+                }
+                catch (IOException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
             }
         }
         catch (IOException exception) {
@@ -49,7 +54,33 @@ final class ClickHouseWriterRegistration implements AutoCloseable {
         }
     }
 
+    private static FileLock tryLock(FileChannel channel) throws IOException, SQLException {
+        FileLock lock;
+        try {
+            lock = channel.tryLock();
+        }
+        catch (OverlappingFileLockException exception) {
+            throw new SQLException("This CoreProtect installation already has an active ClickHouse writer", exception);
+        }
+        if (lock == null) {
+            throw new SQLException("This CoreProtect installation already has an active ClickHouse writer");
+        }
+        return lock;
+    }
+
     synchronized UUID schemaOwner() throws SQLException {
+        UUID stored = lookupGateOwner();
+        try {
+            Object fileKey = Files.readAttributes(writerFile, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
+            String identity = stored + "\n" + writerFile.toRealPath() + "\n" + fileKey;
+            return UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8));
+        }
+        catch (IOException exception) {
+            throw new SQLException("Unable to read ClickHouse schema owner identity", exception);
+        }
+    }
+
+    synchronized UUID lookupGateOwner() throws SQLException {
         verifyOwned();
         try {
             if (writerChannel.size() == 0) {
@@ -68,13 +99,10 @@ final class ClickHouseWriterRegistration implements AutoCloseable {
             while (value.hasRemaining() && writerChannel.read(value) >= 0) {
             }
             value.flip();
-            UUID stored = UUID.fromString(StandardCharsets.US_ASCII.decode(value).toString());
-            Object fileKey = Files.readAttributes(writerFile, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
-            String identity = stored + "\n" + writerFile.toRealPath() + "\n" + fileKey;
-            return UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8));
+            return UUID.fromString(StandardCharsets.US_ASCII.decode(value).toString());
         }
         catch (IOException | IllegalArgumentException exception) {
-            throw new SQLException("Unable to read ClickHouse schema owner identity", exception);
+            throw new SQLException("Unable to read ClickHouse writer identity", exception);
         }
     }
 

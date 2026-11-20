@@ -28,7 +28,6 @@ import net.coreprotect.utility.Color;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.MaterialUtils;
 import net.coreprotect.utility.WorldUtils;
-import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.DatabaseUtils;
 import net.coreprotect.utility.EntitySpawnTracking;
 
@@ -50,20 +49,7 @@ public class ChestTransactionLookup {
                 return result;
             }
 
-            if (command == null) {
-                if (commandSender.hasPermission("coreprotect.co")) {
-                    command = "co";
-                }
-                else if (commandSender.hasPermission("coreprotect.core")) {
-                    command = "core";
-                }
-                else if (commandSender.hasPermission("coreprotect.coreprotect")) {
-                    command = "coreprotect";
-                }
-                else {
-                    command = "co";
-                }
-            }
+            command = InspectorLookup.resolveCommand(command, commandSender);
 
             boolean found = false;
             int x = (int) Math.floor(l.getX());
@@ -78,9 +64,6 @@ public class ChestTransactionLookup {
             int displayX = l.getBlockX();
             int displayY = l.getBlockY();
             int displayZ = l.getBlockZ();
-            int count = 0;
-            int rowMax = page * limit;
-            int pageStart = rowMax - limit;
 
             String table = ConfigHandler.prefix + "container";
             String tableName = "container";
@@ -114,90 +97,76 @@ public class ChestTransactionLookup {
                 where = LocationQuery.predicate("wid", " = " + worldId) + " AND " + LocationQuery.predicate("x", " = " + l.getBlockX()) + " AND " + LocationQuery.predicate("z", " = " + l.getBlockZ()) + " AND y = " + y;
             }
 
-            boolean combinedDuckDBPage = ConfigHandler.databaseType.isDuckDB();
-            String query;
-            ResultSet results;
-            if (combinedDuckDBPage) {
-                String sourceTable;
+            String spatialTable = null;
+            if (ConfigHandler.databaseType.isDuckDB()) {
                 if (entitySpawnRowId != null) {
-                    sourceTable = DuckDBLookupQuery.entityTable(statement.getConnection(), tableName, Collections.singleton(entitySpawnRowId), "spatial_rows");
+                    spatialTable = DuckDBLookupQuery.entityTable(statement.getConnection(), tableName, Collections.singleton(entitySpawnRowId), "spatial_rows");
                 }
                 else {
                     int minimumX = exact ? l.getBlockX() : Math.min(x, x2);
                     int maximumX = exact ? l.getBlockX() : Math.max(x, x2);
                     int minimumZ = exact ? l.getBlockZ() : Math.min(z, z2);
                     int maximumZ = exact ? l.getBlockZ() : Math.max(z, z2);
-                    sourceTable = DuckDBLookupQuery.spatialTable(statement.getConnection(), tableName, worldId, minimumX, maximumX, minimumZ, maximumZ, "spatial_rows");
+                    spatialTable = DuckDBLookupQuery.spatialTable(statement.getConnection(), tableName, worldId, minimumX, maximumX, minimumZ, maximumZ, "spatial_rows");
                 }
-                String columns = "data_rows.time,data_rows." + ConfigHandler.databaseType.getUserColumn() + ",data_rows.wid,data_rows.x,data_rows.y,data_rows.z,data_rows.action,data_rows.type,data_rows.data,data_rows.amount,data_rows.metadata,data_rows.rolled_back";
-                query = DuckDBLookupQuery.pageQuery(sourceTable, table, where, columns, entitySpawnRowId != null, limit, pageStart);
-                results = statement.executeQuery(query);
             }
-            else {
-                query = "SELECT COUNT(*) as count FROM " + table + " " + index + "WHERE " + where + " LIMIT 1 OFFSET 0";
-                results = statement.executeQuery(query);
+            String columns = "time," + ConfigHandler.databaseType.getUserColumn() + ",wid,x,y,z,action,type,data,amount,metadata,rolled_back";
+            InspectorLookup.Page pageQuery = InspectorLookup.queryPage(statement, table, spatialTable, index, where, columns, order, entitySpawnRowId != null, page, limit);
+            long count = pageQuery.count;
+
+            try (ResultSet results = statement.executeQuery(pageQuery.query)) {
                 while (results.next()) {
-                    count = results.getInt("count");
-                }
-                results.close();
-                query = "SELECT time," + ConfigHandler.databaseType.getUserColumn() + ",wid,x,y,z,action,type,data,amount,metadata,rolled_back FROM " + table + " " + index + "WHERE " + where + " ORDER BY " + order + " LIMIT " + limit + " OFFSET " + pageStart;
-                results = statement.executeQuery(query);
-            }
-            while (results.next()) {
-                if (combinedDuckDBPage) {
-                    count = results.getInt("count");
-                    if (results.getObject("result_id") == null) {
-                        continue;
+                    if (pageQuery.combinedCount) {
+                        count = results.getLong("count");
+                        if (results.getObject("result_id") == null) {
+                            continue;
+                        }
                     }
-                }
-                int resultUserId = results.getInt("user");
-                int resultAction = results.getInt("action");
-                int resultType = results.getInt("type");
-                int resultData = results.getInt("data");
-                long resultTime = results.getLong("time");
-                int resultAmount = results.getInt("amount");
-                int resultRolledBack = results.getInt("rolled_back");
-                int resultWorldId = results.getInt("wid");
-                int resultX = results.getInt("x");
-                int resultY = results.getInt("y");
-                int resultZ = results.getInt("z");
-                byte[] resultMetadata = DatabaseUtils.getBytes(results, "metadata");
-                String tooltip = ItemUtils.getEnchantments(resultMetadata, resultType, resultAmount);
+                    int resultUserId = results.getInt("user");
+                    int resultAction = results.getInt("action");
+                    int resultType = results.getInt("type");
+                    int resultData = results.getInt("data");
+                    long resultTime = results.getLong("time");
+                    int resultAmount = results.getInt("amount");
+                    int resultRolledBack = results.getInt("rolled_back");
+                    int resultWorldId = results.getInt("wid");
+                    int resultX = results.getInt("x");
+                    int resultY = results.getInt("y");
+                    int resultZ = results.getInt("z");
+                    byte[] resultMetadata = DatabaseUtils.getBytes(results, "metadata");
+                    String tooltip = ItemUtils.getEnchantments(resultMetadata, resultType, resultAmount);
 
-                String resultUser = UserStatement.getName(statement.getConnection(), resultUserId);
-                String timeAgo = ChatUtils.getTimeSince(resultTime, time, true);
+                    String resultUser = UserStatement.getName(statement.getConnection(), resultUserId);
+                    String timeAgo = ChatUtils.getTimeSince(resultTime, time, true);
 
-                if (!found) {
-                    result.add(Color.WHITE + "----- " + Color.DARK_AQUA + Phrase.build(Phrase.CONTAINER_HEADER) + Color.WHITE + " ----- " + ChatUtils.getCoordinates(command, displayWorldId, displayX, displayY, displayZ, false, false));
-                }
-                found = true;
+                    if (!found) {
+                        result.add(Color.WHITE + "----- " + Color.DARK_AQUA + Phrase.build(Phrase.CONTAINER_HEADER) + Color.WHITE + " ----- " + ChatUtils.getCoordinates(command, displayWorldId, displayX, displayY, displayZ, false, false));
+                    }
+                    found = true;
 
-                String selector = (resultAction != 0 ? Selector.FIRST : Selector.SECOND);
-                String tag = (resultAction != 0 ? Color.GREEN + "+" : Color.RED + "-");
-                String rbFormat = "";
-                if (resultRolledBack == 1 || resultRolledBack == 3) {
-                    rbFormat = Color.STRIKETHROUGH;
-                }
+                    String selector = (resultAction != 0 ? Selector.FIRST : Selector.SECOND);
+                    String tag = (resultAction != 0 ? Color.GREEN + "+" : Color.RED + "-");
+                    String rbFormat = "";
+                    if (resultRolledBack == 1 || resultRolledBack == 3) {
+                        rbFormat = Color.STRIKETHROUGH;
+                    }
 
-                String target = MaterialUtils.getBlockDisplayName(resultType, resultData);
-                if (target.length() > 0 && !target.contains(":")) {
-                    target = "minecraft:" + target.toLowerCase(Locale.ROOT) + "";
-                }
+                    String target = MaterialUtils.getBlockDisplayName(resultType, resultData);
+                    if (target.length() > 0 && !target.contains(":")) {
+                        target = "minecraft:" + target.toLowerCase(Locale.ROOT) + "";
+                    }
 
-                // Hide "minecraft:" for now.
-                if (target.startsWith("minecraft:")) {
-                    target = target.substring("minecraft:".length());
-                }
+                    target = InspectorLookup.displayTarget(target);
 
-                String coordinateInfo = "";
-                if (entitySpawnRowId != null && (displayWorldId != resultWorldId || displayX != resultX || displayY != resultY || displayZ != resultZ)) {
-                    coordinateInfo = ChatUtils.getCoordinateTooltip(resultWorldId, resultX, resultY, resultZ, Phrase.build(Phrase.LOOKUP_ENTITY_ORIGIN), true);
+                    String coordinateInfo = "";
+                    if (entitySpawnRowId != null && (displayWorldId != resultWorldId || displayX != resultX || displayY != resultY || displayZ != resultZ)) {
+                        coordinateInfo = ChatUtils.getCoordinateTooltip(resultWorldId, resultX, resultY, resultZ, Phrase.build(Phrase.LOOKUP_ENTITY_ORIGIN), true);
+                    }
+                    result.add(timeAgo + " " + tag + " " + Phrase.build(Phrase.LOOKUP_CONTAINER, Color.DARK_AQUA + rbFormat + resultUser + Color.WHITE + rbFormat, "x" + resultAmount, ChatUtils.createTooltip(Color.DARK_AQUA + rbFormat + target, tooltip) + coordinateInfo + Color.WHITE, selector));
+                    PluginChannelListener.getInstance().sendData(commandSender, resultTime, Phrase.LOOKUP_CONTAINER, selector, resultUser, target, resultAmount, displayX, displayY, displayZ, displayWorldId, rbFormat, true, tag.contains("+"));
                 }
-                result.add(timeAgo + " " + tag + " " + Phrase.build(Phrase.LOOKUP_CONTAINER, Color.DARK_AQUA + rbFormat + resultUser + Color.WHITE + rbFormat, "x" + resultAmount, ChatUtils.createTooltip(Color.DARK_AQUA + rbFormat + target, tooltip) + coordinateInfo + Color.WHITE, selector));
-                PluginChannelListener.getInstance().sendData(commandSender, resultTime, Phrase.LOOKUP_CONTAINER, selector, resultUser, target, resultAmount, displayX, displayY, displayZ, displayWorldId, rbFormat, true, tag.contains("+"));
             }
-            results.close();
-            int totalPages = (int) Math.ceil(count / (limit + 0.0));
+            int totalPages = InspectorLookup.totalPages(count, limit);
 
             if (found) {
                 if (count > limit) {
@@ -206,7 +175,7 @@ public class ChestTransactionLookup {
                 }
             }
             else {
-                if (rowMax > count && count > 0) {
+                if (pageQuery.end > count && count > 0) {
                     result.add(Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_RESULTS_PAGE, Selector.SECOND));
                 }
                 else {
@@ -214,7 +183,7 @@ public class ChestTransactionLookup {
                 }
             }
 
-            String history = entitySpawnRowId == null
+            String history = entitySpawnRowId == null && !exact
                     ? x + "." + y + "." + z + "." + worldId + "." + x2 + "." + y2 + "." + z2 + "." + limit
                     : displayX + "." + displayY + "." + displayZ + "." + displayWorldId + "." + displayX + "." + displayY + "." + displayZ + "." + limit;
             LookupThrottle.publish(name, () -> {
@@ -227,7 +196,7 @@ public class ChestTransactionLookup {
             });
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            Database.reportDatabaseFailure(e);
         }
 
         return result;

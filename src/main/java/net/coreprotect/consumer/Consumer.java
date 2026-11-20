@@ -13,8 +13,6 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.bukkit.Bukkit;
-import org.bukkit.block.BlockState;
-import org.bukkit.inventory.ItemStack;
 
 import net.coreprotect.CoreProtect;
 import net.coreprotect.config.ConfigHandler;
@@ -22,6 +20,7 @@ import net.coreprotect.consumer.process.Process;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.DuckDBRecovery;
 import net.coreprotect.language.Phrase;
+import net.coreprotect.thread.Scheduler;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.Color;
 import net.coreprotect.utility.ErrorReporter;
@@ -61,23 +60,7 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
     // public static ConcurrentHashMap<Integer, Integer[]> consumer_id = new ConcurrentHashMap<>();
     public static Map<Integer, Integer[]> consumer_id = Collections.synchronizedMap(new HashMap<>());
     public static ConcurrentHashMap<Integer, Map<Integer, String[]>> consumerUsers = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, String>> consumerStrings = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, Object[]>> consumerSigns = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, ItemStack[]>> consumerContainers = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, Object>> consumerInventories = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, List<BlockState>>> consumerBlockList = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, List<Object[]>>> consumerObjectArrayList = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, List<Object>>> consumerObjectList = new ConcurrentHashMap<>(4, 0.75f, 2);
-
     public static ConcurrentHashMap<Integer, Map<Integer, Object>> consumerObjects = new ConcurrentHashMap<>(4, 0.75f, 2);
-    // ^merge maps into single object based map
 
     private static void errorDelay() {
         try {
@@ -114,20 +97,24 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
     }
 
     public static int getConsumerSize(int id) {
-        if (id == 0 || id == 1) {
-            return Consumer.consumer.get(id).size();
+        if (id != 0 && id != 1) {
+            return 0;
         }
-
-        return 0;
+        synchronized (Queue.class) {
+            ArrayList<Object[]> records = consumer.get(id);
+            return records == null ? 0 : records.size();
+        }
     }
 
     public static boolean hasPendingConsumerData() {
-        synchronized (consumer_id) {
-            for (int id = 0; id < 2; id++) {
-                Integer[] state = consumer_id.get(id);
-                ArrayList<Object[]> data = consumer.get(id);
-                if ((state != null && state[1] > 0) || (data != null && !data.isEmpty())) {
-                    return true;
+        synchronized (Queue.class) {
+            synchronized (consumer_id) {
+                for (int id = 0; id < 2; id++) {
+                    Integer[] state = consumer_id.get(id);
+                    ArrayList<Object[]> data = consumer.get(id);
+                    if ((state != null && state[1] > 0) || (data != null && !data.isEmpty())) {
+                        return true;
+                    }
                 }
             }
             return false;
@@ -162,20 +149,10 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
         Consumer.consumerUsers.put(1, new HashMap<>());
         Consumer.consumerObjects.put(0, new HashMap<>());
         Consumer.consumerObjects.put(1, new HashMap<>());
-        Consumer.consumerStrings.put(0, new HashMap<>());
-        Consumer.consumerStrings.put(1, new HashMap<>());
-        Consumer.consumerSigns.put(0, new HashMap<>());
-        Consumer.consumerSigns.put(1, new HashMap<>());
-        Consumer.consumerInventories.put(0, new HashMap<>());
-        Consumer.consumerInventories.put(1, new HashMap<>());
-        Consumer.consumerBlockList.put(0, new HashMap<>());
-        Consumer.consumerBlockList.put(1, new HashMap<>());
-        Consumer.consumerObjectArrayList.put(0, new HashMap<>());
-        Consumer.consumerObjectArrayList.put(1, new HashMap<>());
-        Consumer.consumerObjectList.put(0, new HashMap<>());
-        Consumer.consumerObjectList.put(1, new HashMap<>());
-        Consumer.consumerContainers.put(0, new HashMap<>());
-        Consumer.consumerContainers.put(1, new HashMap<>());
+    }
+
+    public static boolean isConsumerThread() {
+        return Thread.currentThread() == consumerThread;
     }
 
     public static boolean isRunning() {
@@ -233,6 +210,17 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
 
     public static void lockDatabaseAccess() {
         databaseLifecycle.readLock().lock();
+    }
+
+    public static boolean tryLockDatabaseAccess() {
+        if (isDatabaseReloadBlocked() || !databaseLifecycle.readLock().tryLock()) {
+            return false;
+        }
+        if (isDatabaseReloadBlocked()) {
+            unlockDatabaseAccess();
+            return false;
+        }
+        return true;
     }
 
     public static void unlockDatabaseAccess() {
@@ -633,8 +621,12 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
 
     @Override
     public void uncaughtException(Thread thread, Throwable e) {
+        haltPersistence();
         ErrorReporter.report(e);
-        Bukkit.getPluginManager().disablePlugin(CoreProtect.getInstance());
+        CoreProtect plugin = CoreProtect.getInstance();
+        if (plugin != null) {
+            Scheduler.runTask(plugin, () -> Bukkit.getPluginManager().disablePlugin(plugin));
+        }
     }
 
     public static void startConsumer() {

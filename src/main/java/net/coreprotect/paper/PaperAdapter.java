@@ -2,6 +2,7 @@ package net.coreprotect.paper;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -14,6 +15,7 @@ import org.bukkit.block.Sign;
 import org.bukkit.block.Skull;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Firework;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Villager;
@@ -87,6 +89,11 @@ public class PaperAdapter implements PaperInterface {
     }
 
     @Override
+    public LivingEntity getFireworkRider(Firework firework) {
+        return BukkitAdapter.ADAPTER.getFireworkRider(firework);
+    }
+
+    @Override
     public boolean isStopping(Server server) {
         return false;
     }
@@ -117,8 +124,8 @@ public class PaperAdapter implements PaperInterface {
     }
 
     @Override
-    public void teleportAsync(Entity entity, Location location) {
-        entity.teleport(location);
+    public CompletableFuture<Boolean> teleportAsync(Entity entity, Location location) {
+        return CompletableFuture.completedFuture(entity.teleport(location));
     }
 
     @Override

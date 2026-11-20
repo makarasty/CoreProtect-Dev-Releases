@@ -20,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
@@ -58,6 +59,7 @@ import net.coreprotect.database.clickhouse.ClickHouseDatabase;
 import net.coreprotect.database.clickhouse.ClickHouseJdbcConfig;
 import net.coreprotect.database.statement.UserStatement;
 import net.coreprotect.language.Phrase;
+import net.coreprotect.language.Selector;
 import net.coreprotect.listener.ListenerHandler;
 import net.coreprotect.model.BlockGroup;
 import net.coreprotect.paper.PaperAdapter;
@@ -704,10 +706,10 @@ public class ConfigHandler {
         if (preparedClickHouse == null) {
             throw new IllegalArgumentException("Prepared ClickHouse database cannot be null");
         }
-        loadDatabase(preparedClickHouse, true);
+        loadDatabase(preparedClickHouse, false);
     }
 
-    private static void loadDatabase(ClickHouseDatabase preparedClickHouse, boolean migrationActivation) {
+    private static boolean loadDatabase(ClickHouseDatabase preparedClickHouse, boolean startup) {
         if (preparedClickHouse != null && !ConfigHandler.databaseType.isClickHouse()) {
             throw new IllegalArgumentException("A prepared ClickHouse database can only activate a ClickHouse target");
         }
@@ -717,13 +719,15 @@ public class ConfigHandler {
             if (preparedClickHouse != null) {
                 Database.installClickHouseDatabase(preparedClickHouse);
             }
-            else {
-                initializeDatabase();
+            else if (!initializeDatabase(startup)) {
+                ConfigHandler.databaseReachable = false;
+                return false;
             }
-            if (!migrationActivation && Database.hasIncompleteMigrationMarker()) {
+            if (preparedClickHouse == null && Database.hasIncompleteMigrationMarker()) {
                 throw new IllegalStateException("Database contains an incomplete CoreProtect migration and cannot be activated");
             }
             ConfigHandler.databaseReachable = true;
+            return true;
         }
         catch (Exception exception) {
             Database.closeConnection();
@@ -735,7 +739,20 @@ public class ConfigHandler {
         }
     }
 
-    private static void initializeDatabase() {
+    public static String mysqlJdbcUrl() {
+        return "jdbc:mysql://" + host + ":" + port + "/" + database;
+    }
+
+    public static Properties mysqlConnectionProperties() {
+        Properties properties = new Properties();
+        properties.setProperty("characterEncoding", "UTF-8");
+        properties.setProperty("connectTimeout", "10000");
+        properties.setProperty("allowPublicKeyRetrieval", "true");
+        properties.setProperty("useSSL", Boolean.toString(Config.getGlobal().ENABLE_SSL));
+        return properties;
+    }
+
+    private static boolean initializeDatabase(boolean startup) throws SQLException {
         if (ConfigHandler.databaseType.isClickHouse()) {
             try {
                 Config global = Config.getGlobal();
@@ -745,7 +762,7 @@ public class ConfigHandler {
             catch (Exception exception) {
                 throw new IllegalStateException("Failed to initialize ClickHouse", exception);
             }
-            return;
+            return true;
         }
 
         if (ConfigHandler.databaseType.isEmbedded()) {
@@ -786,7 +803,7 @@ public class ConfigHandler {
                 config.setDriverClassName("com.mysql.jdbc.Driver");
             }
 
-            config.setJdbcUrl("jdbc:mysql://" + ConfigHandler.host + ":" + ConfigHandler.port + "/" + ConfigHandler.database);
+            config.setJdbcUrl(mysqlJdbcUrl());
             config.setUsername(ConfigHandler.username);
             config.setPassword(ConfigHandler.password);
             config.setMaximumPoolSize(ConfigHandler.maximumPoolSize);
@@ -794,8 +811,7 @@ public class ConfigHandler {
             // Keep connection age below short limits used by some managed MySQL hosts.
             config.setMaxLifetime(60000);
             config.setKeepaliveTime(0);
-            config.addDataSourceProperty("characterEncoding", "UTF-8");
-            config.addDataSourceProperty("connectTimeout", "10000");
+            config.setDataSourceProperties(mysqlConnectionProperties());
             /* https://github.com/brettwooldridge/HikariCP/wiki/MySQL-Configuration */
             /*
              * https://cdn.oreillystatic.com/en/assets/1/event/21/Connector_J%20Performance%
@@ -809,14 +825,27 @@ public class ConfigHandler {
             config.addDataSourceProperty("rewriteBatchedStatements", "true");
             config.addDataSourceProperty("cacheServerConfiguration", "true");
             config.addDataSourceProperty("maintainTimeStats", "false");
-            /* Disable SSL to suppress the unverified server identity warning */
-            config.addDataSourceProperty("allowPublicKeyRetrieval", "true");
-            config.addDataSourceProperty("useSSL", Config.getGlobal().ENABLE_SSL);
-
             ConfigHandler.hikariDataSource = new HikariDataSource(config);
         }
 
+        return initializeSchema(startup);
+    }
+
+    private static boolean initializeSchema(boolean startup) throws SQLException {
+        if (startup && ConfigHandler.databaseType.isMySQL() && Config.getGlobal().DATABASE_LOCK) {
+            try (Connection connection = Database.getConnection(true, 0)) {
+                if (connection == null) {
+                    return false;
+                }
+                try (Statement statement = connection.createStatement()) {
+                    if (!checkDatabaseLock(statement, true)) {
+                        return false;
+                    }
+                }
+            }
+        }
         Database.createDatabaseTables(ConfigHandler.prefix, false, null, ConfigHandler.databaseType, false);
+        return true;
     }
 
     public static boolean loadMaterials(Statement statement) {
@@ -869,7 +898,18 @@ public class ConfigHandler {
     public static int resolveIdentifierId(CacheType type, String value, boolean create) {
         IdentifierStore store = identifierStore(type.kind);
         Integer cached = store.values.get().get(value);
-        return cached != null ? cached : resolveMissingIdentifierId(store, value, create);
+        if (cached != null) {
+            return cached;
+        }
+        if (!Consumer.tryLockDatabaseAccess()) {
+            return -1;
+        }
+        try {
+            return resolveMissingIdentifierId(store, value, create);
+        }
+        finally {
+            Consumer.unlockDatabaseAccess();
+        }
     }
 
     private static int resolveMissingIdentifierId(IdentifierStore store, String value, boolean create) {
@@ -913,9 +953,7 @@ public class ConfigHandler {
                 return -1;
             }
             if (clickHouse) {
-                if (!queueIdentifier(store.kind, id, value)) {
-                    throw new IllegalStateException("Database persistence halted before the ClickHouse identifier could be queued");
-                }
+                publishClickHouseIdentifiers(store.kind, Map.of(id, value));
             }
             store.store(id, value);
         }
@@ -923,6 +961,21 @@ public class ConfigHandler {
             queueIdentifier(store.kind, id, value);
         }
         return id;
+    }
+
+    private static void publishClickHouseIdentifiers(ReferenceKind kind, Map<Integer, String> identifiers) {
+        if (identifiers.isEmpty()) {
+            return;
+        }
+        if (Consumer.isPersistenceHalted()) {
+            throw new IllegalStateException("Database persistence halted before the ClickHouse identifiers could be published");
+        }
+        try {
+            Database.publishClickHouseIdentifiers(kind, identifiers);
+        }
+        catch (SQLException exception) {
+            throw new IllegalStateException("Unable to publish ClickHouse " + kind.name().toLowerCase(Locale.ROOT) + " identifiers", exception);
+        }
     }
 
     private static boolean queueIdentifier(ReferenceKind kind, int id, String value) {
@@ -942,10 +995,40 @@ public class ConfigHandler {
         }
     }
 
-    public static synchronized void uncacheIdentifier(ReferenceKind kind, int id, String value) {
+    public static synchronized void cachePublishedIdentifier(ReferenceKind kind, int id, String value) {
         IdentifierStore store = identifierStore(kind);
-        store.values.get().remove(value, Integer.valueOf(id));
-        store.reversed.get().remove(Integer.valueOf(id), value);
+        if (store.canStore(id, value)) {
+            store.store(id, value);
+        }
+    }
+
+    public static void insertQueuedIdentifier(ConsumerWriteBatch batch, Statement statement, ReferenceKind kind, int index, Object candidate, int id) throws Exception {
+        if (!(candidate instanceof String)) {
+            return;
+        }
+        String value = (String) candidate;
+        IdentifierStore store = identifierStore(kind);
+        if (!databaseType.isClickHouse()) {
+            boolean exists;
+            try (ResultSet rows = statement.executeQuery("SELECT id FROM " + prefix + store.table + " WHERE id=" + id + " LIMIT 1")) {
+                exists = rows.next();
+            }
+            if (exists) {
+                Chat.console(Phrase.build(Phrase.CACHE_ERROR, kind == ReferenceKind.BLOCK_DATA ? "blockdata" : store.valueColumn));
+                Chat.console(Phrase.build(Phrase.CACHE_RELOAD, kind == ReferenceKind.WORLD ? Selector.SECOND : Selector.FIRST));
+                loadIdentifierCache(statement, kind, true);
+                return;
+            }
+        }
+        synchronized (ConfigHandler.class) {
+            if (!store.canStore(id, value)) {
+                throw new SQLException("Identifier mapping changed for " + store.table + " row " + id);
+            }
+            batch.addReference(kind, index, id, value);
+            if (!databaseType.isClickHouse()) {
+                store.store(id, value);
+            }
+        }
     }
 
     public static String getIdentifierValue(CacheType type, int id) {
@@ -954,7 +1037,15 @@ public class ConfigHandler {
         if (value != null || id < 1 || !databaseType.isClickHouse()) {
             return value;
         }
-        return loadMissingIdentifierValue(store, id);
+        if (!Consumer.tryLockDatabaseAccess()) {
+            return null;
+        }
+        try {
+            return databaseType.isClickHouse() ? loadMissingIdentifierValue(store, id) : store.reversed.get().get(id);
+        }
+        finally {
+            Consumer.unlockDatabaseAccess();
+        }
     }
 
     private static synchronized String loadMissingIdentifierValue(IdentifierStore store, int id) {
@@ -1007,9 +1098,25 @@ public class ConfigHandler {
     }
 
     private static boolean loadIdentifierCache(Statement statement, ReferenceKind kind) {
+        return loadIdentifierCache(statement, kind, false);
+    }
+
+    private static synchronized boolean loadIdentifierCache(Statement statement, ReferenceKind kind, boolean preserveQueued) {
         IdentifierStore store = identifierStore(kind);
         try {
             IdentifierCache cache = loadIdentifierCache(statement, store.table, store.valueColumn);
+            if (preserveQueued) {
+                Map<Integer, String> existing = store.reversed.get();
+                synchronized (existing) {
+                    existing.forEach((id, value) -> {
+                        if (!cache.reversed.containsKey(id) && !cache.values.containsKey(value)) {
+                            cache.reversed.put(id, value);
+                            cache.values.put(value, id);
+                        }
+                    });
+                }
+                cache.maximumId = Math.max(cache.maximumId, store.maximum.getAsInt());
+            }
             store.valuesSetter.accept(syncMap(cache.values));
             store.reversedSetter.accept(syncMap(cache.reversed));
             store.maximumSetter.accept(cache.maximumId);
@@ -1027,7 +1134,7 @@ public class ConfigHandler {
                 return false;
             }
             try (Statement statement = connection.createStatement()) {
-                return loadIdentifierCache(statement, kind);
+                return loadIdentifierCache(statement, kind, true);
             }
         }
         catch (Exception e) {
@@ -1047,7 +1154,7 @@ public class ConfigHandler {
         return loadWorldsFromDatabase(statement);
     }
 
-    private static boolean loadWorlds(Statement statement, List<String> worldNames) {
+    private static synchronized boolean loadWorlds(Statement statement, List<String> worldNames) {
         try {
             IdentifierCache cache = loadIdentifierCache(statement, "world", "world");
             Map<Integer, String> queuedWorlds = new HashMap<>();
@@ -1065,9 +1172,7 @@ public class ConfigHandler {
             }
             boolean clickHouse = databaseType.isClickHouse();
             if (clickHouse) {
-                if (!queueIdentifiers(ReferenceKind.WORLD, queuedWorlds)) {
-                    throw new IllegalStateException("Database persistence halted before the ClickHouse world identifiers could be queued");
-                }
+                publishClickHouseIdentifiers(ReferenceKind.WORLD, queuedWorlds);
             }
             ConfigHandler.worlds = syncMap(cache.values);
             ConfigHandler.worldsReversed = syncMap(cache.reversed);
@@ -1096,6 +1201,10 @@ public class ConfigHandler {
     }
 
     private static boolean checkDatabaseLock(Statement statement) {
+        return checkDatabaseLock(statement, false);
+    }
+
+    private static boolean checkDatabaseLock(Statement statement, boolean allowMissingMySQLTable) {
         try {
             if (Config.getGlobal().DATABASE_LOCK) {
                 boolean locked = true;
@@ -1125,6 +1234,12 @@ public class ConfigHandler {
 
                             locked = true;
                         }
+                    }
+                    catch (SQLException e) {
+                        if (allowMissingMySQLTable && e.getErrorCode() == 1146 && "42S02".equals(e.getSQLState())) {
+                            return true;
+                        }
+                        throw e;
                     }
                 }
             }
@@ -1157,7 +1272,10 @@ public class ConfigHandler {
             BlockGroup.initialize();
 
             ConfigHandler.loadConfig(); // Load (or create) the configuration file.
-            ConfigHandler.loadDatabase(); // Initialize MySQL and create tables if necessary.
+            if (!loadDatabase(null, startup)) {
+                cleanupFailedInitialization(startup);
+                return false;
+            }
 
             if (startup) {
                 ListenerHandler.registerNetworking(); // Register channels for networking API
@@ -1174,6 +1292,31 @@ public class ConfigHandler {
         }
 
         boolean initialized = false;
+        try {
+            if (!prepareDatabaseInitialization(startup)) {
+                return false;
+            }
+            if (startup) {
+                ConfigHandler.serverRunning = true;
+            }
+            initialized = Patch.versionCheck(startup);
+            return initialized;
+        }
+        catch (CancellationException e) {
+            throw e;
+        }
+        catch (Exception e) {
+            ErrorReporter.report(e);
+            return false;
+        }
+        finally {
+            if (!initialized) {
+                cleanupFailedInitialization(startup);
+            }
+        }
+    }
+
+    private static boolean prepareDatabaseInitialization(boolean startup) throws SQLException {
         try (Connection connection = Database.getConnection(true, 0)) {
             if (connection == null) {
                 return false;
@@ -1202,27 +1345,7 @@ public class ConfigHandler {
                     }
                 });
 
-                if (startup && !ConfigHandler.checkDatabaseLock(statement)) {
-                    return false;
-                }
-
-                if (startup) {
-                    ConfigHandler.serverRunning = true; // Set as running before patching
-                }
-                initialized = Patch.versionCheck(statement); // Minor upgrades & version check
-                return initialized;
-            }
-        }
-        catch (CancellationException e) {
-            throw e;
-        }
-        catch (Exception e) {
-            ErrorReporter.report(e);
-            return false;
-        }
-        finally {
-            if (!initialized) {
-                cleanupFailedInitialization(startup);
+                return !startup || checkDatabaseLock(statement);
             }
         }
     }
@@ -1244,17 +1367,23 @@ public class ConfigHandler {
         }
     }
 
-    public static void clearTransientPlayerState() {
+    public static void clearLookupHistory() {
         synchronized (lookupThrottle) {
-            inspecting.clear();
             lookupThrottle.clear();
-            teleportThrottle.clear();
             lookupType.clear();
             lookupPage.clear();
             lookupCommand.clear();
             lookupSessions.clear();
             lookupEntityContainer.clear();
             lookupEntityInteraction.clear();
+        }
+    }
+
+    public static void clearTransientPlayerState() {
+        synchronized (lookupThrottle) {
+            inspecting.clear();
+            teleportThrottle.clear();
+            clearLookupHistory();
         }
         hopperAbort.clear();
         hopperSuccess.clear();

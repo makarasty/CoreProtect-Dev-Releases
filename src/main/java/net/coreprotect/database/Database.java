@@ -15,6 +15,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
 
@@ -57,7 +58,6 @@ public class Database extends Queue {
     public static final int ENTITY_MAP = 11;
     public static final int BLOCKDATA = 12;
     public static final int ITEM = 13;
-    public static final int ENTITY_SPAWN = 14;
     public static final int ENTITY_CONTAINER = 15;
     public static final int ENTITY_INTERACTION = 16;
 
@@ -94,11 +94,11 @@ public class Database extends Queue {
         SQL_QUERIES.put(ART, "INSERT INTO %sprefix%art_map (id, art) VALUES (?, ?)");
         SQL_QUERIES.put(ENTITY_MAP, "INSERT INTO %sprefix%entity_map (id, entity) VALUES (?, ?)");
         SQL_QUERIES.put(BLOCKDATA, "INSERT INTO %sprefix%blockdata_map (id, data) VALUES (?, ?)");
-        SQL_QUERIES.put(ENTITY_SPAWN, "INSERT INTO %sprefix%entity_spawn (time, uuid, wid, current_wid, origin_x, origin_y, origin_z, x, y, z, yaw, pitch, data, removed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         SQL_QUERIES.put(ENTITY_CONTAINER, "INSERT INTO %sprefix%entity_container (time, %user%, entity_spawn_rowid, wid, x, y, z, type, data, amount, metadata, action, rolled_back) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         SQL_QUERIES.put(ENTITY_INTERACTION, "INSERT INTO %sprefix%entity_interaction (time, %user%, entity_spawn_rowid, wid, x, y, z, type, action, metadata, rolled_back) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     }
 
+    @Deprecated
     public static void beginTransaction(Statement statement, boolean isMySQL) throws SQLException {
         beginTransaction(statement, isMySQL ? DatabaseType.MYSQL : DatabaseType.SQLITE);
     }
@@ -126,87 +126,107 @@ public class Database extends Queue {
         }
         finally {
             if (!started) {
-                Consumer.transacting = false;
-                Consumer.interrupt = false;
-                TRANSACTION_ROLLBACK_ONLY.remove();
-                TRANSACTION_ROLLBACK_ACKNOWLEDGED.remove();
+                clearTransactionState();
             }
         }
     }
 
-    public static void commitTransaction(Statement statement, boolean isMySQL) throws Exception {
-        commitTransactionChecked(statement, isMySQL ? DatabaseType.MYSQL : DatabaseType.SQLITE);
+    @Deprecated
+    public static void commitTransaction(Statement statement, boolean isMySQL) throws TransactionCommitException {
+        commitTransaction(statement, isMySQL ? DatabaseType.MYSQL : DatabaseType.SQLITE);
     }
 
-    public static boolean commitTransactionChecked(Statement statement, boolean isMySQL) throws Exception {
+    public static void commitTransaction(Statement statement, DatabaseType databaseType) throws TransactionCommitException {
+        boolean rollbackOnly = isTransactionRollbackOnly();
+        Exception failure = null;
+        try {
+            if (commitTransactionChecked(statement, databaseType)) {
+                return;
+            }
+        }
+        catch (SQLException | InterruptedException exception) {
+            failure = exception;
+        }
+        try {
+            if (!rollbackOnly && !databaseType.isClickHouse()) {
+                rollbackTransaction(statement, databaseType);
+            }
+        }
+        finally {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        throw new TransactionCommitException(failure);
+    }
+
+    @Deprecated
+    public static boolean commitTransactionChecked(Statement statement, boolean isMySQL) throws SQLException, InterruptedException {
         return commitTransactionChecked(statement, isMySQL ? DatabaseType.MYSQL : DatabaseType.SQLITE);
     }
 
-    public static boolean commitTransactionChecked(Statement statement, DatabaseType databaseType) throws Exception {
+    public static boolean commitTransactionChecked(Statement statement, DatabaseType databaseType) throws SQLException, InterruptedException {
         return commitTransactionChecked(statement, databaseType, null);
     }
 
-    public static boolean commitTransactionChecked(Statement statement, DatabaseType databaseType, Runnable onCommitAttempt) throws Exception {
+    public static boolean commitTransactionChecked(Statement statement, DatabaseType databaseType, Runnable onCommitAttempt) throws SQLException, InterruptedException {
         rejectClickHouseTransaction(databaseType);
         if (TRANSACTION_ROLLBACK_ONLY.get()) {
-            if (databaseType.isDuckDB() && TRANSACTION_ROLLBACK_ACKNOWLEDGED.get()) {
-                return rollbackTransaction(statement, databaseType);
-            }
-            return false;
+            boolean acknowledged = databaseType.isDuckDB() && TRANSACTION_ROLLBACK_ACKNOWLEDGED.get();
+            boolean rolledBack = rollbackTransaction(statement, databaseType);
+            return acknowledged && rolledBack;
         }
 
         int count = 0;
 
-        while (true) {
-            try {
-                if (databaseType.isDuckDB()) {
-                    Connection connection = statement.getConnection();
-                    if (onCommitAttempt != null) {
-                        onCommitAttempt.run();
-                    }
-                    connection.commit();
-                    try {
-                        connection.setAutoCommit(true);
-                    }
-                    catch (Exception cleanupException) {
-                        reportDatabaseFailure(cleanupException);
+        try {
+            while (true) {
+                try {
+                    if (databaseType.isDuckDB()) {
+                        Connection connection = statement.getConnection();
+                        if (onCommitAttempt != null) {
+                            onCommitAttempt.run();
+                        }
+                        connection.commit();
                         try {
-                            connection.close();
+                            connection.setAutoCommit(true);
                         }
-                        catch (Exception closeException) {
-                            reportDatabaseFailure(closeException);
+                        catch (Exception cleanupException) {
+                            reportDatabaseFailure(cleanupException);
+                            try {
+                                connection.close();
+                            }
+                            catch (Exception closeException) {
+                                reportDatabaseFailure(closeException);
+                            }
                         }
                     }
-                }
-                else {
-                    if (onCommitAttempt != null) {
-                        onCommitAttempt.run();
+                    else {
+                        if (onCommitAttempt != null) {
+                            onCommitAttempt.run();
+                        }
+                        statement.executeUpdate(databaseType.isMySQL() ? "COMMIT" : "COMMIT TRANSACTION");
                     }
-                    statement.executeUpdate(databaseType.isMySQL() ? "COMMIT" : "COMMIT TRANSACTION");
+                    return true;
                 }
-                Consumer.transacting = false;
-                Consumer.interrupt = false;
-                TRANSACTION_ROLLBACK_ONLY.remove();
-                TRANSACTION_ROLLBACK_ACKNOWLEDGED.remove();
-                return true;
-            }
-            catch (Exception e) {
-                if (e.getMessage() != null && e.getMessage().startsWith("[SQLITE_BUSY]") && count < 30) {
-                    Thread.sleep(1000);
-                    count++;
+                catch (Exception e) {
+                    if (e.getMessage() != null && e.getMessage().startsWith("[SQLITE_BUSY]") && count < 30) {
+                        Thread.sleep(1000);
+                        count++;
 
-                    continue;
+                        continue;
+                    }
+                    reportDatabaseFailure(e);
+                    return false;
                 }
-                reportDatabaseFailure(e);
-                Consumer.transacting = false;
-                Consumer.interrupt = false;
-                TRANSACTION_ROLLBACK_ONLY.remove();
-                TRANSACTION_ROLLBACK_ACKNOWLEDGED.remove();
-                return false;
             }
+        }
+        finally {
+            clearTransactionState();
         }
     }
 
+    @Deprecated
     public static boolean rollbackTransaction(Statement statement, boolean isMySQL) {
         return rollbackTransaction(statement, isMySQL ? DatabaseType.MYSQL : DatabaseType.SQLITE);
     }
@@ -243,12 +263,16 @@ public class Database extends Queue {
             reportDatabaseFailure(e);
         }
         finally {
-            Consumer.transacting = false;
-            Consumer.interrupt = false;
-            TRANSACTION_ROLLBACK_ONLY.remove();
-            TRANSACTION_ROLLBACK_ACKNOWLEDGED.remove();
+            clearTransactionState();
         }
         return rolledBack;
+    }
+
+    private static void clearTransactionState() {
+        Consumer.transacting = false;
+        Consumer.interrupt = false;
+        TRANSACTION_ROLLBACK_ONLY.remove();
+        TRANSACTION_ROLLBACK_ACKNOWLEDGED.remove();
     }
 
     public static void acknowledgeRollbackOnlyTransaction() {
@@ -302,10 +326,9 @@ public class Database extends Queue {
         }
     }
 
+    @Deprecated
     public static void performCheckpoint(Statement statement, boolean isMySQL) throws SQLException {
-        if (!isMySQL) {
-            statement.executeUpdate("PRAGMA wal_checkpoint(TRUNCATE)");
-        }
+        performCheckpoint(statement, isMySQL ? DatabaseType.MYSQL : DatabaseType.SQLITE);
     }
 
     public static void performCheckpoint(Statement statement, DatabaseType databaseType) throws SQLException {
@@ -381,76 +404,86 @@ public class Database extends Queue {
     }
 
     public static Connection getConnection(boolean force, boolean startup, boolean onlyCheckTransacting, int waitTime) {
-        Connection connection = null;
-        if (Consumer.isDatabaseReloadBlocked()) {
+        if (!databaseAccessAllowed(force)) {
             return null;
         }
-        Consumer.lockDatabaseAccess();
-        try {
-            if (Consumer.isDatabaseReloadBlocked()) {
-                return null;
-            }
-            if (!force && (ConfigHandler.converterRunning || ConfigHandler.purgeRunning)) {
-                return connection;
-            }
-            if (ConfigHandler.databaseType.isMySQL()) {
-                try {
-                    connection = ConfigHandler.hikariDataSource.getConnection();
-                    ConfigHandler.databaseReachable = true;
-                }
-                catch (Exception e) {
-                    ConfigHandler.databaseReachable = false;
-                    Chat.sendConsoleMessage(Color.RED + "[CoreProtect] " + Phrase.build(Phrase.MYSQL_UNAVAILABLE));
-                    ErrorReporter.report(e);
-                }
-            }
-            else if (ConfigHandler.databaseType.isDuckDB()) {
-                connection = DuckDBDatabase.getConnection();
-                ConfigHandler.databaseReachable = true;
-            }
-            else if (ConfigHandler.databaseType.isClickHouse()) {
-                connection = requireClickHouseDatabase().openConnection();
-                ConfigHandler.databaseReachable = true;
-            }
-            else {
-                if (Consumer.transacting && onlyCheckTransacting) {
-                    Consumer.interrupt = true;
-                }
-
-                long startTime = System.nanoTime();
-                while (Consumer.isPaused && !force && (Consumer.transacting || !onlyCheckTransacting)) {
-                    Thread.sleep(1);
-                    long pauseTime = (System.nanoTime() - startTime) / 1000000;
-
-                    if (pauseTime >= waitTime) {
-                        return connection;
-                    }
-                }
-
-                String database = "jdbc:sqlite:" + ConfigHandler.path + ConfigHandler.sqlite + "";
-                connection = DriverManager.getConnection(database);
-
-                ConfigHandler.databaseReachable = true;
-            }
-
-            if (connection != null) {
-                registerConnection(connection);
-            }
+        if (ConfigHandler.databaseType.isSQLite() && Consumer.transacting && onlyCheckTransacting) {
+            Consumer.interrupt = true;
         }
-        catch (Exception e) {
-            if (ConfigHandler.databaseType.isColumnar()) {
+        try {
+            long started = System.nanoTime();
+            while (sqlitePaused(force, onlyCheckTransacting)) {
+                if (!databaseAccessAllowed(force) || (System.nanoTime() - started) / 1_000_000L >= waitTime) {
+                    return null;
+                }
+                Thread.sleep(1L);
+            }
+            return openRegisteredConnection(force, onlyCheckTransacting, true);
+        }
+        catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+        catch (Exception exception) {
+            DatabaseType databaseType = ConfigHandler.databaseType;
+            if (databaseType.isMySQL() || databaseType.isColumnar()) {
                 ConfigHandler.databaseReachable = false;
             }
-            boolean recoveryRequested = ConfigHandler.databaseType.isDuckDB() && DuckDBRecovery.request(e);
-            if (!recoveryRequested && (!ConfigHandler.databaseType.isClickHouse() || shouldReportClickHouseConnectionError())) {
-                ErrorReporter.report(e);
+            if (databaseType.isMySQL()) {
+                Chat.sendConsoleMessage(Color.RED + "[CoreProtect] " + Phrase.build(Phrase.MYSQL_UNAVAILABLE));
             }
+            boolean recoveryRequested = databaseType.isDuckDB() && DuckDBRecovery.request(exception);
+            if (!recoveryRequested && (!databaseType.isClickHouse() || shouldReportClickHouseConnectionError())) {
+                ErrorReporter.report(exception);
+            }
+        }
+        return null;
+    }
+
+    private static boolean databaseAccessAllowed(boolean force) {
+        return !Consumer.isDatabaseReloadBlocked() && (force || (!ConfigHandler.converterRunning && !ConfigHandler.purgeRunning));
+    }
+
+    private static boolean sqlitePaused(boolean force, boolean onlyCheckTransacting) {
+        return !force && ConfigHandler.databaseType.isSQLite() && Consumer.isPaused && (Consumer.transacting || !onlyCheckTransacting);
+    }
+
+    private static Connection openRegisteredConnection(boolean force, boolean onlyCheckTransacting, boolean publishReachability) throws Exception {
+        Consumer.lockDatabaseAccess();
+        try {
+            if (!databaseAccessAllowed(force) || sqlitePaused(force, onlyCheckTransacting)) {
+                return null;
+            }
+            DatabaseType databaseType = ConfigHandler.databaseType;
+            Connection connection;
+            if (databaseType.isMySQL()) {
+                var dataSource = ConfigHandler.hikariDataSource;
+                if (dataSource == null) {
+                    throw new SQLException("The CoreProtect MySQL connection pool is unavailable");
+                }
+                connection = dataSource.getConnection();
+            }
+            else if (databaseType.isDuckDB()) {
+                connection = DuckDBDatabase.getConnection();
+            }
+            else if (databaseType.isClickHouse()) {
+                connection = requireClickHouseDatabase().openConnection();
+            }
+            else {
+                Properties properties = new Properties();
+                properties.setProperty("busy_timeout", "5000");
+                connection = DriverManager.getConnection("jdbc:sqlite:" + ConfigHandler.path + ConfigHandler.sqlite, properties);
+            }
+            if (connection != null) {
+                registerConnection(connection);
+                if (publishReachability) {
+                    ConfigHandler.databaseReachable = true;
+                }
+            }
+            return connection;
         }
         finally {
             Consumer.unlockDatabaseAccess();
         }
-
-        return connection;
     }
 
     public static boolean awaitConnectionDrain(long timeoutMillis) throws InterruptedException {
@@ -553,6 +586,10 @@ public class Database extends Queue {
         ConfigHandler.databaseTables.addAll(DATABASE_TABLES);
     }
 
+    public static ClickHouseDatabase getActiveClickHouseDatabase() throws SQLException {
+        return requireClickHouseDatabase();
+    }
+
     public static synchronized ClickHouseDatabase detachClickHouseDatabase() throws SQLException {
         ClickHouseDatabase database = clickHouseDatabase;
         if (database == null) {
@@ -575,31 +612,20 @@ public class Database extends Queue {
     }
 
     public static boolean hasIncompleteMigrationMarker() throws SQLException {
-        Connection connection;
-        if (ConfigHandler.databaseType.isMySQL()) {
-            connection = ConfigHandler.hikariDataSource.getConnection();
-        }
-        else if (ConfigHandler.databaseType.isDuckDB()) {
-            try {
-                connection = DuckDBDatabase.getConnection();
+        try (Connection connection = openRegisteredConnection(true, false, false)) {
+            if (connection == null) {
+                throw new SQLException("Unable to open the database to inspect its migration marker");
             }
-            catch (Exception exception) {
-                if (exception instanceof SQLException) {
-                    throw (SQLException) exception;
-                }
-                throw new SQLException("Unable to inspect the DuckDB migration marker", exception);
+            String sql = "SELECT 1 FROM " + ConfigHandler.prefix + "database_lock WHERE rowid=1 AND status=" + DATABASE_LOCK_MIGRATION_INCOMPLETE + " LIMIT 1";
+            try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
+                return resultSet.next();
             }
         }
-        else if (ConfigHandler.databaseType.isClickHouse()) {
-            connection = requireClickHouseDatabase().openConnection();
+        catch (SQLException exception) {
+            throw exception;
         }
-        else {
-            connection = DriverManager.getConnection("jdbc:sqlite:" + ConfigHandler.path + ConfigHandler.sqlite);
-        }
-
-        String sql = "SELECT 1 FROM " + ConfigHandler.prefix + "database_lock WHERE rowid=1 AND status=" + DATABASE_LOCK_MIGRATION_INCOMPLETE + " LIMIT 1";
-        try (Connection checkedConnection = connection; Statement statement = checkedConnection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
-            return resultSet.next();
+        catch (Exception exception) {
+            throw new SQLException("Unable to inspect the CoreProtect database migration marker", exception);
         }
     }
 
@@ -608,6 +634,10 @@ public class Database extends Queue {
             return new ClickHouseConsumerWriteBatch(requireClickHouseDatabase(), ConfigHandler.prefix);
         }
         return new RelationalConsumerWriteBatch(connection, ConfigHandler.databaseType);
+    }
+
+    public static void publishClickHouseIdentifiers(ConsumerWriteBatch.ReferenceKind kind, Map<Integer, String> identifiers) throws SQLException {
+        requireClickHouseDatabase().publishIdentifiers(kind, identifiers);
     }
 
     public static int nextClickHouseIdentifierId(ConsumerWriteBatch.ReferenceKind kind, String value, int currentMaximum) throws SQLException {
@@ -628,14 +658,19 @@ public class Database extends Queue {
             return;
         }
         int timestamp = (int) (System.currentTimeMillis() / 1000L);
-        statement.executeUpdate("INSERT INTO " + ConfigHandler.prefix + "version (time,version) VALUES ('" + timestamp + "', '" + version + "')");
+        try (PreparedStatement insert = statement.getConnection().prepareStatement(
+                "INSERT INTO " + ConfigHandler.prefix + "version (time,version) VALUES (?,?)")) {
+            insert.setInt(1, timestamp);
+            insert.setString(2, version);
+            insert.executeUpdate();
+        }
     }
 
     public static long purgeClickHouse(long startTime, long endTime, int worldId, List<Integer> blockTypes, boolean optimize) throws SQLException {
         if (!Config.getGlobal().DATABASE_LOCK) {
             throw new SQLException("ClickHouse purge requires database-lock to be enabled and every other CoreProtect installation sharing the database and prefix to be stopped");
         }
-        return requireClickHouseDatabase().purge(startTime, endTime, worldId, blockTypes, optimize);
+        return requireClickHouseDatabase().purgeExclusive(startTime, endTime, worldId, blockTypes, optimize);
     }
 
     public static void cancelClickHousePurge() {
@@ -783,12 +818,13 @@ public class Database extends Queue {
             }
         }
         else {
-            createSQLiteTables(prefix, forcePrefix, forceConnection, purge);
+            createSQLiteTables(prefix, forceConnection, purge);
         }
     }
 
     private static void createMySQLTables(String prefix, Connection forceConnection, boolean purge) {
-        try (Connection connection = (forceConnection != null ? forceConnection : Database.getConnection(true, true, true, 0))) {
+        try (Connection openedConnection = forceConnection == null ? Database.getConnection(true, true, true, 0) : null) {
+            Connection connection = forceConnection == null ? openedConnection : forceConnection;
             if (connection == null) {
                 throw new SQLException("Unable to connect to MySQL while initializing the schema");
             }
@@ -801,9 +837,6 @@ public class Database extends Queue {
             }
         }
         catch (Exception e) {
-            if (forceConnection == null) {
-                Config.getGlobal().MYSQL = false;
-            }
             throw new IllegalStateException("Failed to initialize the MySQL schema", e);
         }
     }
@@ -821,15 +854,15 @@ public class Database extends Queue {
 
         // Chat
         index = ", INDEX(time), INDEX(user,time), INDEX(wid,x,z,time), INDEX message_prefix_index(message(16))";
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "chat(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int (3), z int, message varchar(16000)" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "chat(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int, z int, message varchar(16000)" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
 
         // Command
         index = ", INDEX(time), INDEX(user,time), INDEX(wid,x,z,time), INDEX message_prefix_index(message(16))";
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "command(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int (3), z int, message varchar(16000)" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "command(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int, z int, message varchar(16000)" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
 
         // Container
         index = ", INDEX(wid,x,z,time), INDEX(user,time), INDEX(type,time)";
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "container(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid), time int, user int, wid int, x int, y int, z int, type int, data int, amount int, metadata mediumblob, action tinyint, rolled_back tinyint" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "container(rowid bigint NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid), time int, user int, wid int, x int, y int, z int, type int, data int, amount int, metadata mediumblob, action tinyint, rolled_back tinyint" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
 
         // Entity container
         index = ", INDEX(wid,x,z,time), INDEX(entity_spawn_rowid,time), INDEX(user,time), INDEX(type,time)";
@@ -841,7 +874,7 @@ public class Database extends Queue {
 
         // Item
         index = ", INDEX(wid,x,z,time), INDEX(user,time), INDEX(type,time)";
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "item(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid), time int, user int, wid int, x int, y int, z int, type int, data mediumblob, amount int, action tinyint, rolled_back tinyint" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "item(rowid bigint NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid), time int, user int, wid int, x int, y int, z int, type int, data mediumblob, amount int, action tinyint, rolled_back tinyint" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
 
         // Database lock
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "database_lock(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),status tinyint,time int) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
@@ -867,7 +900,7 @@ public class Database extends Queue {
 
         // Session
         index = ", INDEX(wid,x,z,time), INDEX(action,time), INDEX(user,time), INDEX(time)";
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "session(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int (3), z int, action tinyint" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "session(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int, z int, action tinyint" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
 
         // Sign
         index = ", INDEX(wid,x,z,time), INDEX(user,time), INDEX(time), INDEX line_1_prefix_index(line_1(16)), INDEX line_2_prefix_index(line_2(16)), INDEX line_3_prefix_index(line_3(16)), INDEX line_4_prefix_index(line_4(16)), INDEX line_5_prefix_index(line_5(16)), INDEX line_6_prefix_index(line_6(16)), INDEX line_7_prefix_index(line_7(16)), INDEX line_8_prefix_index(line_8(16))";
@@ -998,15 +1031,18 @@ public class Database extends Queue {
         return candidate.substring(0, maxPrefixLength) + "_" + hash;
     }
 
-    private static void createSQLiteTables(String prefix, boolean forcePrefix, Connection forceConnection, boolean purge) {
-        try (Connection connection = (forceConnection != null ? forceConnection : Database.getConnection(true, 0))) {
+    private static void createSQLiteTables(String prefix, Connection forceConnection, boolean purge) {
+        try (Connection openedConnection = forceConnection == null ? Database.getConnection(true, 0) : null) {
+            Connection connection = forceConnection == null ? openedConnection : forceConnection;
             if (connection == null) {
                 throw new SQLException("Unable to open SQLite while initializing the schema");
             }
             try (Statement statement = connection.createStatement()) {
                 List<String> tableData = new ArrayList<>();
-                List<String> indexData = new ArrayList<>();
-                String attachDatabase = "";
+                Map<String, String> indexData = new HashMap<>();
+                int prefixStart = prefix.lastIndexOf('.') + 1;
+                String attachDatabase = prefix.substring(0, prefixStart);
+                String tablePrefix = prefix.substring(prefixStart);
 
                 if (purge && forceConnection == null) {
                     String query = "ATTACH DATABASE ? AS tmp_db";
@@ -1018,15 +1054,14 @@ public class Database extends Queue {
                 }
 
                 identifyExistingTablesAndIndexes(statement, attachDatabase, tableData, indexData);
-                String tablePrefix = forcePrefix ? prefix : ConfigHandler.prefix;
                 boolean createChatMessagePrefixIndex = !tableData.contains(tablePrefix + "chat");
                 boolean createCommandMessagePrefixIndex = !tableData.contains(tablePrefix + "command");
                 boolean createSignMessagePrefixIndexes = !tableData.contains(tablePrefix + "sign");
-                createSQLiteTableStructures(prefix, statement, tableData);
+                createSQLiteTableStructures(tablePrefix, attachDatabase, statement, tableData);
                 createSQLiteIndexes(tablePrefix, statement, indexData, attachDatabase, purge, createChatMessagePrefixIndex, createCommandMessagePrefixIndex, createSignMessagePrefixIndexes);
 
                 if (!purge && forceConnection == null) {
-                    initializeTables(prefix, statement, DatabaseType.SQLITE);
+                    initializeTables(attachDatabase + tablePrefix, statement, DatabaseType.SQLITE);
                 }
             }
         }
@@ -1035,141 +1070,142 @@ public class Database extends Queue {
         }
     }
 
-    private static void identifyExistingTablesAndIndexes(Statement statement, String attachDatabase, List<String> tableData, List<String> indexData) throws SQLException {
-        String query = "SELECT type,name FROM " + attachDatabase + "sqlite_master WHERE type='table' OR type='index';";
-        ResultSet rs = statement.executeQuery(query);
-        while (rs.next()) {
-            String type = rs.getString("type");
-            if (type.equalsIgnoreCase("table")) {
-                tableData.add(rs.getString("name"));
-            }
-            else if (type.equalsIgnoreCase("index")) {
-                indexData.add(rs.getString("name"));
+    private static void identifyExistingTablesAndIndexes(Statement statement, String attachDatabase, List<String> tableData, Map<String, String> indexData) throws SQLException {
+        String query = "SELECT type,name,tbl_name FROM " + attachDatabase + "sqlite_master WHERE type='table' OR type='index';";
+        try (ResultSet result = statement.executeQuery(query)) {
+            while (result.next()) {
+                String type = result.getString("type");
+                if (type.equalsIgnoreCase("table")) {
+                    tableData.add(result.getString("name"));
+                }
+                else if (type.equalsIgnoreCase("index")) {
+                    indexData.put(result.getString("name"), result.getString("tbl_name"));
+                }
             }
         }
-        rs.close();
     }
 
-    private static void createSQLiteTableStructures(String prefix, Statement statement, List<String> tableData) throws SQLException {
-        if (!tableData.contains(prefix + "art_map")) {
+    private static void createSQLiteTableStructures(String tablePrefix, String attachDatabase, Statement statement, List<String> tableData) throws SQLException {
+        String prefix = attachDatabase + tablePrefix;
+        if (!tableData.contains(tablePrefix + "art_map")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "art_map (id INTEGER, art TEXT);");
         }
-        if (!tableData.contains(prefix + "block")) {
+        if (!tableData.contains(tablePrefix + "block")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "block (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, type INTEGER, data INTEGER, meta BLOB, blockdata BLOB, action INTEGER, rolled_back INTEGER);");
         }
-        if (!tableData.contains(prefix + "chat")) {
+        if (!tableData.contains(tablePrefix + "chat")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "chat (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, message TEXT);");
         }
-        if (!tableData.contains(prefix + "command")) {
+        if (!tableData.contains(tablePrefix + "command")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "command (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, message TEXT);");
         }
-        if (!tableData.contains(prefix + "container")) {
+        if (!tableData.contains(tablePrefix + "container")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "container (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, type INTEGER, data INTEGER, amount INTEGER, metadata BLOB, action INTEGER, rolled_back INTEGER);");
         }
-        if (!tableData.contains(prefix + "entity_container")) {
+        if (!tableData.contains(tablePrefix + "entity_container")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "entity_container (time INTEGER, user INTEGER, entity_spawn_rowid INTEGER NOT NULL, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, type INTEGER, data INTEGER, amount INTEGER, metadata BLOB, action INTEGER, rolled_back INTEGER);");
         }
-        if (!tableData.contains(prefix + "entity_interaction")) {
+        if (!tableData.contains(tablePrefix + "entity_interaction")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "entity_interaction (time INTEGER, user INTEGER, entity_spawn_rowid INTEGER NOT NULL, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, type INTEGER, action INTEGER, metadata BLOB, rolled_back INTEGER);");
         }
-        if (!tableData.contains(prefix + "item")) {
+        if (!tableData.contains(tablePrefix + "item")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "item (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, type INTEGER, data BLOB, amount INTEGER, action INTEGER, rolled_back INTEGER);");
         }
-        if (!tableData.contains(prefix + "database_lock")) {
+        if (!tableData.contains(tablePrefix + "database_lock")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "database_lock (status INTEGER, time INTEGER);");
         }
-        if (!tableData.contains(prefix + "entity")) {
+        if (!tableData.contains(tablePrefix + "entity")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "entity (id INTEGER PRIMARY KEY ASC, time INTEGER, data BLOB);");
         }
-        if (!tableData.contains(prefix + "entity_spawn")) {
+        if (!tableData.contains(tablePrefix + "entity_spawn")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "entity_spawn (id INTEGER PRIMARY KEY ASC, time INTEGER, block_rowid INTEGER, kill_rowid INTEGER, uuid TEXT UNIQUE, wid INTEGER, current_wid INTEGER, origin_x REAL, origin_y REAL, origin_z REAL, x REAL, y REAL, z REAL, yaw REAL, pitch REAL, data BLOB, removed INTEGER);");
         }
-        if (!tableData.contains(prefix + "entity_map")) {
+        if (!tableData.contains(tablePrefix + "entity_map")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "entity_map (id INTEGER, entity TEXT);");
         }
-        if (!tableData.contains(prefix + "material_map")) {
+        if (!tableData.contains(tablePrefix + "material_map")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "material_map (id INTEGER, material TEXT);");
         }
-        if (!tableData.contains(prefix + "blockdata_map")) {
+        if (!tableData.contains(tablePrefix + "blockdata_map")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "blockdata_map (id INTEGER, data TEXT);");
         }
-        if (!tableData.contains(prefix + "session")) {
+        if (!tableData.contains(tablePrefix + "session")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "session (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, action INTEGER);");
         }
-        if (!tableData.contains(prefix + "sign")) {
+        if (!tableData.contains(tablePrefix + "sign")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "sign (time INTEGER, user INTEGER, wid INTEGER, x INTEGER, y INTEGER, z INTEGER, action INTEGER, color INTEGER, color_secondary INTEGER, data INTEGER, waxed INTEGER, face INTEGER, line_1 TEXT, line_2 TEXT, line_3 TEXT, line_4 TEXT, line_5 TEXT, line_6 TEXT, line_7 TEXT, line_8 TEXT, rolled_back INTEGER DEFAULT 0);");
         }
-        if (!tableData.contains(prefix + "skull")) {
+        if (!tableData.contains(tablePrefix + "skull")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "skull (id INTEGER PRIMARY KEY ASC, time INTEGER, owner TEXT, skin TEXT);");
         }
-        if (!tableData.contains(prefix + "user")) {
+        if (!tableData.contains(tablePrefix + "user")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "user (id INTEGER PRIMARY KEY ASC, time INTEGER, user TEXT, uuid TEXT);");
         }
-        if (!tableData.contains(prefix + "username_log")) {
+        if (!tableData.contains(tablePrefix + "username_log")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "username_log (id INTEGER PRIMARY KEY ASC, time INTEGER, uuid TEXT, user TEXT);");
         }
-        if (!tableData.contains(prefix + "version")) {
+        if (!tableData.contains(tablePrefix + "version")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "version (time INTEGER, version TEXT);");
         }
-        if (!tableData.contains(prefix + "world")) {
+        if (!tableData.contains(tablePrefix + "world")) {
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "world (id INTEGER, world TEXT);");
         }
     }
 
-    private static void createSQLiteIndexes(String prefix, Statement statement, List<String> indexData, String attachDatabase, boolean purge, boolean createChatMessagePrefixIndex, boolean createCommandMessagePrefixIndex, boolean createSignMessagePrefixIndexes) {
+    private static void createSQLiteIndexes(String prefix, Statement statement, Map<String, String> indexData, String attachDatabase, boolean purge, boolean createChatMessagePrefixIndex, boolean createCommandMessagePrefixIndex, boolean createSignMessagePrefixIndexes) {
         try {
-            createSQLiteIndex(statement, indexData, attachDatabase, "art_map_id_index", prefix + "art_map(id)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "block_index", prefix + "block(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "block_user_index", prefix + "block(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "block_type_index", prefix + "block(type,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "blockdata_map_id_index", prefix + "blockdata_map(id)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "chat_index", prefix + "chat(time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "chat_user_index", prefix + "chat(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "chat_wid_index", prefix + "chat(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "command_index", prefix + "command(time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "command_user_index", prefix + "command(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "command_wid_index", prefix + "command(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "container_index", prefix + "container(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "container_user_index", prefix + "container(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "container_type_index", prefix + "container(type,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_container_index", prefix + "entity_container(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_container_spawn_index", prefix + "entity_container(entity_spawn_rowid,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_container_user_index", prefix + "entity_container(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_container_type_index", prefix + "entity_container(type,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_interaction_index", prefix + "entity_interaction(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_interaction_spawn_index", prefix + "entity_interaction(entity_spawn_rowid,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_interaction_user_index", prefix + "entity_interaction(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_interaction_type_index", prefix + "entity_interaction(type,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_interaction_action_index", prefix + "entity_interaction(action,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "item_index", prefix + "item(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "item_user_index", prefix + "item(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "item_type_index", prefix + "item(type,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_map_id_index", prefix + "entity_map(id)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_spawn_time_index", prefix + "entity_spawn(time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_spawn_wid_index", prefix + "entity_spawn(wid)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_spawn_current_location_index", prefix + "entity_spawn(current_wid,x,z)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "entity_spawn_kill_rowid_index", prefix + "entity_spawn(kill_rowid)", true);
-            createSQLiteIndex(statement, indexData, attachDatabase, "material_map_id_index", prefix + "material_map(id)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "session_index", prefix + "session(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "session_action_index", prefix + "session(action,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "session_user_index", prefix + "session(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "session_time_index", prefix + "session(time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "sign_index", prefix + "sign(wid,x,z,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "sign_user_index", prefix + "sign(user,time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "sign_time_index", prefix + "sign(time)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "user_index", prefix + "user(user)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "uuid_index", prefix + "user(uuid)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "username_log_uuid_index", prefix + "username_log(uuid,user)");
-            createSQLiteIndex(statement, indexData, attachDatabase, "world_id_index", prefix + "world(id)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "art_map_id_index", prefix + "art_map(id)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "block_index", prefix + "block(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "block_user_index", prefix + "block(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "block_type_index", prefix + "block(type,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "blockdata_map_id_index", prefix + "blockdata_map(id)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "chat_index", prefix + "chat(time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "chat_user_index", prefix + "chat(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "chat_wid_index", prefix + "chat(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "command_index", prefix + "command(time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "command_user_index", prefix + "command(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "command_wid_index", prefix + "command(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "container_index", prefix + "container(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "container_user_index", prefix + "container(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "container_type_index", prefix + "container(type,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_container_index", prefix + "entity_container(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_container_spawn_index", prefix + "entity_container(entity_spawn_rowid,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_container_user_index", prefix + "entity_container(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_container_type_index", prefix + "entity_container(type,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_interaction_index", prefix + "entity_interaction(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_interaction_spawn_index", prefix + "entity_interaction(entity_spawn_rowid,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_interaction_user_index", prefix + "entity_interaction(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_interaction_type_index", prefix + "entity_interaction(type,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_interaction_action_index", prefix + "entity_interaction(action,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "item_index", prefix + "item(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "item_user_index", prefix + "item(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "item_type_index", prefix + "item(type,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_map_id_index", prefix + "entity_map(id)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_spawn_time_index", prefix + "entity_spawn(time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_spawn_wid_index", prefix + "entity_spawn(wid)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_spawn_current_location_index", prefix + "entity_spawn(current_wid,x,z)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "entity_spawn_kill_rowid_index", prefix + "entity_spawn(kill_rowid)", true);
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "material_map_id_index", prefix + "material_map(id)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "session_index", prefix + "session(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "session_action_index", prefix + "session(action,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "session_user_index", prefix + "session(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "session_time_index", prefix + "session(time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "sign_index", prefix + "sign(wid,x,z,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "sign_user_index", prefix + "sign(user,time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "sign_time_index", prefix + "sign(time)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "user_index", prefix + "user(user)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "uuid_index", prefix + "user(uuid)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "username_log_uuid_index", prefix + "username_log(uuid,user)");
+            createSQLiteIndex(statement, indexData, attachDatabase, prefix, "world_id_index", prefix + "world(id)");
             if (createChatMessagePrefixIndex) {
-                createSQLiteIndex(statement, indexData, attachDatabase, "chat_message_prefix_index", prefix + "chat(substr(message,1,16) COLLATE NOCASE)");
+                createSQLiteIndex(statement, indexData, attachDatabase, prefix, "chat_message_prefix_index", prefix + "chat(substr(message,1,16) COLLATE NOCASE)");
             }
             if (createCommandMessagePrefixIndex) {
-                createSQLiteIndex(statement, indexData, attachDatabase, "command_message_prefix_index", prefix + "command(substr(message,1,16) COLLATE NOCASE)");
+                createSQLiteIndex(statement, indexData, attachDatabase, prefix, "command_message_prefix_index", prefix + "command(substr(message,1,16) COLLATE NOCASE)");
             }
             if (createSignMessagePrefixIndexes) {
                 for (int line = 1; line <= 8; line++) {
-                    createSQLiteIndex(statement, indexData, attachDatabase, "sign_line_" + line + "_prefix_index", prefix + "sign(substr(line_" + line + ",1,16) COLLATE NOCASE)");
+                    createSQLiteIndex(statement, indexData, attachDatabase, prefix, "sign_line_" + line + "_prefix_index", prefix + "sign(substr(line_" + line + ",1,16) COLLATE NOCASE)");
                 }
             }
         }
@@ -1181,13 +1217,21 @@ public class Database extends Queue {
         }
     }
 
-    private static void createSQLiteIndex(Statement statement, List<String> indexData, String attachDatabase, String indexName, String indexColumns) throws SQLException {
-        createSQLiteIndex(statement, indexData, attachDatabase, indexName, indexColumns, false);
+    private static void createSQLiteIndex(Statement statement, Map<String, String> indexData, String attachDatabase, String tablePrefix,
+            String indexName, String indexColumns) throws SQLException {
+        createSQLiteIndex(statement, indexData, attachDatabase, tablePrefix, indexName, indexColumns, false);
     }
 
-    private static void createSQLiteIndex(Statement statement, List<String> indexData, String attachDatabase, String indexName, String indexColumns, boolean unique) throws SQLException {
-        if (!indexData.contains(indexName)) {
-            statement.executeUpdate("CREATE " + (unique ? "UNIQUE " : "") + "INDEX IF NOT EXISTS " + attachDatabase + indexName + " ON " + indexColumns + ";");
+    private static void createSQLiteIndex(Statement statement, Map<String, String> indexData, String attachDatabase, String tablePrefix,
+            String indexName, String indexColumns, boolean unique) throws SQLException {
+        String tableName = indexColumns.substring(0, indexColumns.indexOf('('));
+        String legacyTable = indexData.get(indexName);
+        if (tableName.equalsIgnoreCase(legacyTable)) {
+            return;
+        }
+        String scopedName = ("co_".equalsIgnoreCase(tablePrefix) && legacyTable == null ? "" : tablePrefix) + indexName;
+        if (!indexData.containsKey(scopedName)) {
+            statement.executeUpdate("CREATE " + (unique ? "UNIQUE " : "") + "INDEX IF NOT EXISTS " + attachDatabase + scopedName + " ON " + indexColumns + ";");
         }
     }
 
@@ -1226,6 +1270,15 @@ public class Database extends Queue {
     private static void rejectClickHouseTransaction(DatabaseType databaseType) throws SQLException {
         if (databaseType.isClickHouse()) {
             throw new SQLException("ClickHouse writes use immutable consumer batches, not JDBC transactions");
+        }
+    }
+
+    public static final class TransactionCommitException extends SQLException {
+
+        private static final long serialVersionUID = 1L;
+
+        private TransactionCommitException(Exception cause) {
+            super("Unable to commit database transaction", cause);
         }
     }
 

@@ -3,6 +3,8 @@ package net.coreprotect.database.clickhouse;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLDataException;
+import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -24,38 +26,37 @@ final class ClickHouseTargetResolver {
 
     ClickHouseTargetResolver(ClickHouseJdbc jdbc, String database, String prefix, UUID datasetId) {
         this.jdbc = Objects.requireNonNull(jdbc, "jdbc");
-        String validatedPrefix = prefix == null || prefix.isEmpty() ? "" : ClickHouseIdentifiers.requireIdentifier(prefix, "ClickHouse table prefix");
-        eventTable = ClickHouseIdentifiers.qualified(database, validatedPrefix + "event_data");
+        String validatedPrefix = ClickHouseIdentifiers.requirePrefix(prefix);
+        eventTable = ClickHouseIdentifiers.qualified(database, validatedPrefix, "event_data");
         this.datasetId = Objects.requireNonNull(datasetId, "datasetId");
     }
 
     Map<Long, ClickHouseEventPointer> resolve(ClickHouseFamily family, List<Long> requestedRowIds) throws SQLException {
-        Objects.requireNonNull(family, "family");
-        Set<Long> unique = uniqueRowIds(requestedRowIds, "rollback");
-        List<Long> rowIds = new ArrayList<>(unique);
-        Map<Long, ClickHouseEventPointer> pointers = new LinkedHashMap<>();
-        try (Connection connection = jdbc.openConnection()) {
-            for (int offset = 0; offset < rowIds.size(); offset += SELECT_BATCH_SIZE) {
-                resolveBatch(connection, family, rowIds.subList(offset, Math.min(offset + SELECT_BATCH_SIZE, rowIds.size())), pointers, null);
-            }
-        }
-        if (pointers.size() != rowIds.size()) {
-            List<Long> missing = new ArrayList<>(unique);
-            missing.removeAll(pointers.keySet());
-            throw new SQLException("Unable to resolve " + missing.size() + " ClickHouse " + family.getTableName() + " row IDs");
-        }
-        return pointers;
+        return resolveRows(family, requestedRowIds, null, true);
+    }
+
+    Map<Long, ClickHouseEventPointer> resolveAvailable(ClickHouseFamily family, List<Long> requestedRowIds) throws SQLException {
+        return resolveRows(family, requestedRowIds, null, false);
     }
 
     Map<Long, ClickHouseEventPointer> resolveAvailableBlocks(List<Long> requestedRowIds, Map<Long, Integer> actions) throws SQLException {
-        Objects.requireNonNull(actions, "actions");
-        Set<Long> unique = uniqueRowIds(requestedRowIds, "block");
-        List<Long> rowIds = new ArrayList<>(unique);
+        return resolveRows(ClickHouseFamily.BLOCK, requestedRowIds, Objects.requireNonNull(actions, "actions"), false);
+    }
+
+    private Map<Long, ClickHouseEventPointer> resolveRows(ClickHouseFamily family, List<Long> requestedRowIds, Map<Long, Integer> actions, boolean requireAll) throws SQLException {
+        Objects.requireNonNull(family, "family");
+        List<Long> rowIds = new ArrayList<>(uniqueRowIds(requestedRowIds, family.getTableName()));
         Map<Long, ClickHouseEventPointer> pointers = new LinkedHashMap<>();
+        if (rowIds.isEmpty()) {
+            return pointers;
+        }
         try (Connection connection = jdbc.openConnection()) {
             for (int offset = 0; offset < rowIds.size(); offset += SELECT_BATCH_SIZE) {
-                resolveBatch(connection, ClickHouseFamily.BLOCK, rowIds.subList(offset, Math.min(offset + SELECT_BATCH_SIZE, rowIds.size())), pointers, actions);
+                resolveBatch(connection, family, rowIds.subList(offset, Math.min(offset + SELECT_BATCH_SIZE, rowIds.size())), pointers, actions);
             }
+        }
+        if (requireAll && pointers.size() != rowIds.size()) {
+            throw new SQLDataException("Unable to resolve " + (rowIds.size() - pointers.size()) + " ClickHouse " + family.getTableName() + " row IDs");
         }
         return pointers;
     }
@@ -70,6 +71,8 @@ final class ClickHouseTargetResolver {
         }
         String sql = "SELECT rowid,batch_sequence,batch_ordinal,time,wid,x,z" + (actions == null ? "" : ",action") + " FROM " + eventTable + " FINAL"
                 + " WHERE family=?"
+                + (family == ClickHouseFamily.ENTITY_SPAWN ? " AND origin_x IS NOT NULL"
+                        : ClickHouseSchema.rollbackProjection(family.getTableName()) != null ? " AND action IS NOT NULL" : "")
                 + " AND rowid IN(" + placeholders + ")";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, family.getTableName());
@@ -79,14 +82,20 @@ final class ClickHouseTargetResolver {
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
                     long rowId = resultSet.getLong(1);
-                    ClickHouseEventPointer pointer = new ClickHouseEventPointer(datasetId, family, resultSet.getLong(2), resultSet.getInt(3), rowId, resultSet.getInt(4), resultSet.getInt(5), resultSet.getInt(6), resultSet.getInt(7));
+                    ClickHouseEventPointer pointer;
+                    try {
+                        pointer = new ClickHouseEventPointer(datasetId, family, resultSet.getLong(2), resultSet.getInt(3), rowId, resultSet.getInt(4), resultSet.getInt(5), resultSet.getInt(6), resultSet.getInt(7));
+                    }
+                    catch (IllegalArgumentException exception) {
+                        throw new SQLDataException("Invalid ClickHouse " + family.getTableName() + " event pointer for row " + rowId, exception);
+                    }
                     if (pointers.putIfAbsent(rowId, pointer) != null) {
-                        throw new SQLException("ClickHouse " + family.getTableName() + " row ID " + rowId + " resolves to multiple committed facts");
+                        throw new SQLIntegrityConstraintViolationException("ClickHouse " + family.getTableName() + " row ID " + rowId + " resolves to multiple committed facts");
                     }
                     if (actions != null) {
                         Object action = resultSet.getObject(8);
                         if (!(action instanceof Number)) {
-                            throw new SQLException("ClickHouse block row " + rowId + " has no action");
+                            throw new SQLDataException("ClickHouse block row " + rowId + " has no action");
                         }
                         actions.put(rowId, ((Number) action).intValue());
                     }
